@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,23 @@ test("stored key roundtrips with owner-only file permissions", () => {
   const keyFile = join(mkdtempSync(join(tmpdir(), "dscodex-key-")), "dscodex", "config.json");
   writeStoredKey(keyFile, "  sk-test-123  ");
   assert.equal(readStoredKey(keyFile), "sk-test-123");
-  assert.equal(statSync(keyFile).mode & 0o777, 0o600);
+  // Windows has no POSIX mode bits; the file is protected by the account ACL
+  // (and, since the DPAPI change, the ciphertext itself).
+  if (process.platform !== "win32") {
+    assert.equal(statSync(keyFile).mode & 0o777, 0o600);
+  }
+});
+
+test("key file never stores the plaintext on Windows", () => {
+  const keyFile = join(mkdtempSync(join(tmpdir(), "dscodex-key-")), "dscodex", "config.json");
+  writeStoredKey(keyFile, "sk-test-123");
+  const raw = readFileSync(keyFile, "utf8");
+  if (process.platform === "win32") {
+    assert.equal(raw.includes("sk-test-123"), false);
+  } else {
+    assert.ok(raw.includes("sk-test-123"));
+  }
+  assert.equal(readStoredKey(keyFile), "sk-test-123");
 });
 
 test("missing or corrupt key files resolve to empty", () => {

@@ -162,6 +162,14 @@ export function createProxyServer({
         json(response, 503, { error: { message: "DEEPSEEK_API_KEY is not configured in the DSCodex server process" } });
         return;
       }
+      // The loopback port injects the stored DeepSeek key upstream, so it must
+      // not answer anonymous callers (browsers, sandboxed processes, or other
+      // local tools). The stock Codex client always sends its own credentials
+      // (ChatGPT OAuth or an API key), which is enough to pass this gate.
+      if (deepSeek && !request.headers.authorization?.trim()) {
+        json(response, 401, { error: { message: "Missing authorization header: the Codex client must authenticate before the local router can use the DeepSeek key" } });
+        return;
+      }
 
       let outgoingBody = raw;
       if (deepSeek) {

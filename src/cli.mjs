@@ -420,7 +420,7 @@ async function manageKey(subcommand, paths, port) {
   if (subcommand === "set") {
     const key = process.env.DEEPSEEK_API_KEY?.trim() || launchctlKey() || await promptSecret("DeepSeek API Key: ");
     writeStoredKey(paths.keyFile, key);
-    console.log(`Stored DeepSeek API key in ${paths.keyFile} (mode 0600)`);
+    console.log(`Stored DeepSeek API key in ${paths.keyFile} (${process.platform === "win32" ? "DPAPI-encrypted" : "mode 0600"})`);
     if (await health(port)) console.log("Restart the router (stop && start) so the running server picks up the new key");
     return;
   }

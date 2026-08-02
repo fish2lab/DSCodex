@@ -63,7 +63,7 @@ test("routes V4 Flash to native DeepSeek /responses and preserves SSE", async (t
   }));
   const response = await fetch(`${proxyUrl}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json", "content-encoding": "zstd" },
+    headers: { "content-type": "application/json", "content-encoding": "zstd", authorization: "Bearer client-token" },
     body: codexBody,
   });
 
@@ -99,7 +99,7 @@ test("preserves explicit High reasoning", async (t) => {
 
   await fetch(`${proxyUrl}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: "Bearer client-token" },
     body: JSON.stringify({ model: "deepseek/deepseek-v4-flash", reasoning: { effort: "high", summary: "auto" } }),
   });
   assert.deepEqual(observed.reasoning, { effort: "high" });
@@ -123,7 +123,7 @@ test("maps stale lower Codex efforts onto DeepSeek High", async (t) => {
 
   await fetch(`${proxyUrl}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: "Bearer client-token" },
     body: JSON.stringify({ model: "deepseek/deepseek-v4-flash", reasoning: { effort: "medium" } }),
   });
   assert.deepEqual(observed.reasoning, { effort: "high" });
@@ -182,9 +182,35 @@ test("returns an explicit error when V4 Flash is selected without a key", async 
   t.after(async () => { await close(proxy); });
   const response = await fetch(`${proxyUrl}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: "Bearer client-token" },
     body: JSON.stringify({ model: "deepseek/deepseek-v4-flash" }),
   });
   assert.equal(response.status, 503);
   assert.match((await response.json()).error.message, /DEEPSEEK_API_KEY/);
+});
+
+test("rejects DeepSeek requests without a client authorization header", async (t) => {
+  let upstreamHits = 0;
+  const upstream = http.createServer(async (request, response) => {
+    upstreamHits += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    deepSeekKey: "test-key",
+    deepSeekBaseUrl: upstreamUrl,
+    logger: { info() {}, error() {} },
+  });
+  const proxyUrl = await listen(proxy);
+  t.after(async () => { await close(proxy); await close(upstream); });
+
+  const response = await fetch(`${proxyUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek/deepseek-v4-flash", input: "hello" }),
+  });
+  assert.equal(response.status, 401);
+  assert.equal(upstreamHits, 0);
+  assert.match((await response.json()).error.message, /authorization header/i);
 });

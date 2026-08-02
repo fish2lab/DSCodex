@@ -206,7 +206,7 @@ test("marks images with a placeholder when the vision call fails", async (t) => 
   assert.ok(collectText(deepSeekReceived[0]).some((text) => text.includes("could not analyze")));
 });
 
-test("skips the vision rewrite without ChatGPT OAuth headers", async (t) => {
+test("rejects DeepSeek-bound image requests without credentials", async (t) => {
   const chatGptCalls = [];
   const deepSeekReceived = [];
   const chatGpt = createFakeChatGpt(chatGptCalls);
@@ -227,7 +227,7 @@ test("skips the vision rewrite without ChatGPT OAuth headers", async (t) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(deepSeekRequest([IMAGE_A])),
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 401);
   assert.equal(chatGptCalls.length, 0);
-  assert.equal(countImages(deepSeekReceived[0]), 1);
+  assert.equal(deepSeekReceived.length, 0);
 });
