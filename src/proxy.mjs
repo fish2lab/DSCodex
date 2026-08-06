@@ -118,6 +118,78 @@ function convertInputItem(item, compactionSecret) {
   return converted;
 }
 
+// DeepSeek's Responses API requires each function_call_output to directly
+// follow its function_call. Codex can interleave other items (e.g. PostToolUse
+// hook context inserted as a developer message) between the two, which makes
+// DeepSeek reject the request with "No tool output found for tool call ...".
+// Re-pair every output with its call and flush interleaved items right after
+// the pair so ordering stays valid while preserving overall item order.
+function normalizeToolOutputOrder(items) {
+  if (!Array.isArray(items)) return items;
+  const result = [];
+  const deferred = [];
+  const pendingCalls = [];
+  let turnReasoning = null;
+  let emittedCallsInTurn = 0;
+  for (const item of items) {
+    if (!item || typeof item !== "object") {
+      result.push(item);
+      continue;
+    }
+    if (item.type === "reasoning") {
+      turnReasoning = item;
+      emittedCallsInTurn = 0;
+      if (pendingCalls.length > 0) {
+        deferred.push(item);
+      } else {
+        result.push(item);
+      }
+      continue;
+    }
+    if (item.type === "message" && (item.role === "assistant" || item.role === "user")) {
+      emittedCallsInTurn = 0;
+      if (pendingCalls.length > 0) {
+        deferred.push(item);
+      } else {
+        result.push(item);
+      }
+      continue;
+    }
+    if (item.type === "function_call") {
+      pendingCalls.push(item);
+      continue;
+    }
+    if (item.type === "function_call_output") {
+      const callId = item.call_id ?? item.id;
+      const index = pendingCalls.findIndex((call) => (call.call_id ?? call.id) === callId);
+      if (index !== -1) {
+        const call = pendingCalls.splice(index, 1)[0];
+        // DeepSeek's Responses API rejects an assistant turn that contains more
+        // than one function_call unless each extra call has its own
+        // reasoning_text (it reports a misleading "reasoning_text must be
+        // passed back" otherwise). Duplicate the turn's reasoning for every
+        // additional parallel call so multi-call turns replay cleanly.
+        if (turnReasoning && emittedCallsInTurn > 0) {
+          result.push({ ...turnReasoning, content: turnReasoning.content?.map((part) => ({ ...part })) });
+        }
+        result.push(call);
+        emittedCallsInTurn += 1;
+      }
+      result.push(item);
+      result.push(...deferred);
+      deferred.length = 0;
+      continue;
+    }
+    if (pendingCalls.length > 0) {
+      deferred.push(item);
+    } else {
+      result.push(item);
+    }
+  }
+  result.push(...pendingCalls, ...deferred);
+  return result;
+}
+
 export function buildDeepSeekBody(input, { compactionSecret = "" } = {}) {
   const body = structuredClone(input);
   const requestedEffort = body.reasoning?.effort;
@@ -136,9 +208,11 @@ export function buildDeepSeekBody(input, { compactionSecret = "" } = {}) {
   delete body.metadata;
   delete body.service_tier;
   if (Array.isArray(body.input)) {
-    body.input = body.input
-      .map((item) => convertInputItem(item, compactionSecret))
-      .filter((item) => item != null);
+    body.input = normalizeToolOutputOrder(
+      body.input
+        .map((item) => convertInputItem(item, compactionSecret))
+        .filter((item) => item != null),
+    );
   }
   return body;
 }
