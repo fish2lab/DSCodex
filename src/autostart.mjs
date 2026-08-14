@@ -4,6 +4,8 @@ import { join, win32 } from "node:path";
 export const LAUNCHD_LABEL = "com.dscodex.router";
 export const SYSTEMD_UNIT = "dscodex.service";
 export const WINDOWS_TASK = "DSCodex";
+export const WINDOWS_RESTART_COUNT = 255;
+export const WINDOWS_RESTART_INTERVAL_MINUTES = 1;
 
 export function autostartKind(platform = process.platform) {
   if (platform === "darwin") return "launchd";
@@ -86,38 +88,67 @@ function psQuote(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-function winQuote(value) {
-  return `"${String(value).replaceAll('"', '\\"')}"`;
+function vbsString(value) {
+  return `"${String(value).replaceAll('"', '""')}"`;
 }
 
-function powershellPath() {
-  return win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-
-function psPath(value, homeDir) {
+function vbsPath(value, homeDir) {
   const path = String(value);
   const homePrefix = String(homeDir).replace(/[\\/]+$/, "");
   const lowerPath = path.toLowerCase();
   const lowerHome = homePrefix.toLowerCase();
-  if (homePrefix && lowerPath === lowerHome) return "$env:USERPROFILE";
+  if (homePrefix && lowerPath === lowerHome) {
+    return 'shell.ExpandEnvironmentStrings("%USERPROFILE%")';
+  }
   if (homePrefix && (lowerPath.startsWith(`${lowerHome}\\`) || lowerPath.startsWith(`${lowerHome}/`))) {
     // wscript reads generated .vbs files through the active ANSI code page.
     // Keep non-ASCII user names out of the VBS source and resolve them at run time.
-    return `($env:USERPROFILE + ${psQuote(path.slice(homePrefix.length))})`;
+    return `shell.ExpandEnvironmentStrings("%USERPROFILE%") & ${vbsString(path.slice(homePrefix.length))}`;
   }
-  return psQuote(path);
+  return vbsString(path);
 }
 
-// The task runs wscript.exe on this one-liner so no console window flashes at
-// logon. It deliberately avoids `cmd /c`: a cmd string would need escaping for
-// `&`, `^`, `|`, `<`, `>` etc., so paths (which may contain those characters)
-// are passed to PowerShell as single-quoted arguments instead and the router
-// log is appended with PowerShell's `*>>`.
-export function buildWindowsVbs({ nodePath, cliPath, port, logPath, homeDir = homedir() }) {
+// The task runs wscript.exe on this shim so no console window flashes at logon.
+// VBS waits for the Node supervisor and propagates its exit code. The supervisor
+// owns log redirection and crash restarts; avoiding a Windows PowerShell pipeline
+// is important because PowerShell 5 turns redirected native stderr into a
+// terminating NativeCommandError when ErrorActionPreference is Stop.
+export function buildWindowsVbs({ nodePath, cliPath, port, codexHome = homedir(), homeDir = homedir() }) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid port: ${port}`);
   }
-  const script = `$ErrorActionPreference='Stop'; & ${psPath(nodePath, homeDir)} ${psPath(cliPath, homeDir)} serve --port ${port} *>> ${psPath(logPath, homeDir)}`;
-  const commandLine = `${winQuote(powershellPath())} -NoProfile -NonInteractive -WindowStyle Hidden -Command ${winQuote(script)}`;
-  return `CreateObject("Wscript.Shell").Run "${commandLine.replaceAll('"', '""')}", 0, False\r\n`;
+  return [
+    'Set shell = CreateObject("Wscript.Shell")',
+    `nodePath = ${vbsPath(nodePath, homeDir)}`,
+    `cliPath = ${vbsPath(cliPath, homeDir)}`,
+    `codexHome = ${vbsPath(codexHome, homeDir)}`,
+    'shell.Environment("Process")("CODEX_HOME") = codexHome',
+    `command = Chr(34) & nodePath & Chr(34) & " " & Chr(34) & cliPath & Chr(34) & " supervise --port ${port}"`,
+    'WScript.Quit shell.Run(command, 0, True)',
+    "",
+  ].join("\r\n");
+}
+
+export function encodeWindowsVbs(source) {
+  // WSH reliably reads UTF-16LE scripts with a BOM. This covers repositories
+  // and custom CODEX_HOME paths containing characters outside the ANSI codepage.
+  return Buffer.from(`\uFEFF${source}`, "utf16le");
+}
+
+// Register through the ScheduledTasks PowerShell module instead of schtasks'
+// CLI-only defaults. The explicit interactive principal scopes the logon
+// trigger to the current user, needs no stored password, and allows a standard
+// user to own the task. RestartOnFailure makes Windows match launchd/systemd.
+export function buildWindowsRegisterScript({ taskName, vbsPath, windowsDir = process.env.SystemRoot ?? "C:\\Windows" }) {
+  const wscript = win32.join(windowsDir, "System32", "wscript.exe");
+  return [
+    "$ErrorActionPreference='Stop'",
+    `$action=New-ScheduledTaskAction -Execute ${psQuote(wscript)} -Argument ${psQuote(`"${vbsPath}"`)}`,
+    "$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()",
+    "$user=$identity.Name",
+    "$trigger=New-ScheduledTaskTrigger -AtLogOn -User $user",
+    "$principal=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited",
+    `$settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount ${WINDOWS_RESTART_COUNT} -RestartInterval (New-TimeSpan -Minutes ${WINDOWS_RESTART_INTERVAL_MINUTES}) -StartWhenAvailable`,
+    `Register-ScheduledTask -TaskName ${psQuote(taskName)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'DSCodex loopback router' -Force | Out-Null`,
+  ].join("; ");
 }

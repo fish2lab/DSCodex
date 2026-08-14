@@ -60,7 +60,10 @@ The non-negotiable details:
    macOS, systemd user service `dscodex.service` on Linux, Task Scheduler `DSCodex` plus a hidden
    wscript shim on Windows). The generated plist/unit/VBS must never embed the DeepSeek API key —
    the router resolves it from the stored key file at runtime. KeepAlive/Restart only cover
-    crashes: `stop` uses the authenticated shutdown endpoint, the router exits 0 gracefully, and it must stay down. The
+    crashes: the Windows VBS must wait for a hidden supervisor that restarts nonzero router exits, with
+    Task Scheduler restart settings as a second fallback; registration must finish before replacing a healthy
+    manual router, and a failed handoff must restore that router. `stop` uses the authenticated shutdown
+    endpoint, the router exits 0 gracefully, and it must stay down. The
    `serve` process owns `~/.codex/dscodex/server.pid` no matter who launched it, so `stop` works
    for autostarted instances too. `uninstall` must disable autostart and delete the generated
    artifacts.

@@ -69,7 +69,7 @@ npm test
 node src/cli.mjs key set
 node src/cli.mjs proxy set http://127.0.0.1:10808   # 可选
 node src/cli.mjs install && node src/cli.mjs start && node src/cli.mjs doctor
-node src/cli.mjs autostart enable   # 可选：登录自启
+node src/cli.mjs autostart enable   # 可选：登录自启；路由崩溃后自动恢复
 ```
 
 CLI 默认 **High**；加 `-c 'model_reasoning_effort="max"'` 使用 **Max**。

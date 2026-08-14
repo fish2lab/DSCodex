@@ -20,6 +20,7 @@ function clone(value) {
 // start). Backfill known-required fields on native entries with safe
 // defaults; the DeepSeek entry sets its own values explicitly.
 const NATIVE_ENTRY_DEFAULTS = {
+  prefer_websockets: false,
   supports_reasoning_summaries: false,
 };
 
@@ -27,6 +28,13 @@ function backfillNativeEntry(model) {
   const entry = clone(model);
   for (const [key, value] of Object.entries(NATIVE_ENTRY_DEFAULTS)) {
     if (entry[key] === undefined) entry[key] = value;
+  }
+  // Codex CLI 0.146+ requires this legacy top-level field even though current
+  // desktop caches carry the same instructions only in model_messages.
+  if (typeof entry.base_instructions !== "string") {
+    entry.base_instructions = typeof entry.model_messages?.instructions_template === "string"
+      ? entry.model_messages.instructions_template
+      : "";
   }
   return entry;
 }
@@ -39,7 +47,7 @@ function replaceIdentity(value, productName) {
 }
 
 export function buildDeepSeekCatalogEntry(template, model = DEEPSEEK_MODELS[0]) {
-  const entry = clone(template);
+  const entry = backfillNativeEntry(template);
   entry.slug = model.pickerSlug;
   entry.display_name = model.displayName;
   entry.description = `${model.productName} via the native Responses API.`;

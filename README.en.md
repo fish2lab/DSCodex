@@ -68,7 +68,7 @@ Fully quit (⌘Q) and relaunch the ChatGPT app, start a **new** task, and pick `
 node src/cli.mjs key set
 node src/cli.mjs proxy set http://127.0.0.1:10808   # optional
 node src/cli.mjs install && node src/cli.mjs start && node src/cli.mjs doctor
-node src/cli.mjs autostart enable   # optional: start at login
+node src/cli.mjs autostart enable   # optional: start at login and recover router crashes
 ```
 
 CLI default: **High**; add `-c 'model_reasoning_effort="max"'` for **Max**.

@@ -41,6 +41,7 @@ import {
   validateProxyUrl,
 } from "./proxy-config.mjs";
 import { createProxyServer } from "./proxy.mjs";
+import { superviseRouter } from "./supervisor.mjs";
 import {
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
@@ -48,7 +49,9 @@ import {
   autostartKind,
   buildLaunchdPlist,
   buildSystemdUnit,
+  buildWindowsRegisterScript,
   buildWindowsVbs,
+  encodeWindowsVbs,
   launchdPlistPath,
   systemdUnitPath,
 } from "./autostart.mjs";
@@ -86,6 +89,34 @@ function nodePath() {
     // Fall back to the current interpreter below.
   }
   return process.execPath;
+}
+
+function powershellPath() {
+  return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+function windowsTaskInfo() {
+  if (process.platform !== "win32") return null;
+  try {
+    const script = [
+      `$task=Get-ScheduledTask -TaskName '${WINDOWS_TASK}' -ErrorAction Stop`,
+      "$info=$task | Get-ScheduledTaskInfo",
+      "[pscustomobject]@{state=[string]$task.State;lastTaskResult=[long]$info.LastTaskResult} | ConvertTo-Json -Compress",
+    ].join("; ");
+    return JSON.parse(execFileSync(powershellPath(), [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      script,
+    ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+  } catch {
+    return null;
+  }
+}
+
+function windowsTaskResult(value) {
+  if (!Number.isInteger(value)) return "unknown";
+  return `0x${(value >>> 0).toString(16).padStart(8, "0").toUpperCase()}`;
 }
 
 function writeBridgeShim(path) {
@@ -205,6 +236,14 @@ function resolveDeepSeekKey(env = process.env, keyFile = "") {
   return launchctlKey();
 }
 
+function requireProxyRuntime(paths, env = process.env) {
+  const proxyUrl = resolveProxy(env, readProxyUrl(paths.keyFile));
+  if (proxyUrl && !envProxySupported()) {
+    throw new Error(`proxy support requires Node.js >= 24.5 (found ${process.version}); upgrade Node or clear the proxy (proxy clear)`);
+  }
+  return proxyUrl;
+}
+
 function keySource(keyFile, env = process.env) {
   if (env.DEEPSEEK_API_KEY?.trim()) return "environment";
   if (readStoredKey(keyFile)) return `stored in ${keyFile}`;
@@ -301,6 +340,18 @@ function loadModels(paths) {
   return [];
 }
 
+function catalogReady(paths) {
+  try {
+    const models = loadModels(paths);
+    return models.length > 0 && models.every((model) => (
+      typeof model?.slug === "string"
+      && typeof model.base_instructions === "string"
+    ));
+  } catch {
+    return false;
+  }
+}
+
 function tokenValue(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{43}$/.test(value);
 }
@@ -352,6 +403,10 @@ function removePidState(paths, expected) {
     renameSync(paths.pid, claimed);
   } catch (error) {
     if (error?.code === "ENOENT") return;
+    // Some managed Windows environments temporarily deny mutations in the
+    // Codex state directory. A stale owner-only pid file is replaced by the
+    // next serve instance; do not turn graceful shutdown into a crash.
+    if (error?.code === "EPERM" || error?.code === "EACCES") return;
     throw error;
   }
   let matches = false;
@@ -362,7 +417,15 @@ function removePidState(paths, expected) {
     // An invalid or replacement state must be restored, not discarded.
   }
   if (matches) {
-    unlinkSync(claimed);
+    try {
+      unlinkSync(claimed);
+    } catch (error) {
+      if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
+      // Some managed agent environments intercept deletes and can reject them.
+      // The live pid pathname is already gone; scrub control-plane tokens from
+      // the claimed file and keep graceful shutdown from becoming a crash.
+      try { writeFileSync(claimed, "", { mode: 0o600 }); } catch {}
+    }
     return;
   }
   try {
@@ -371,7 +434,13 @@ function removePidState(paths, expected) {
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
   }
-  unlinkSync(claimed);
+  try {
+    unlinkSync(claimed);
+  } catch (error) {
+    if (error?.code !== "EPERM" && error?.code !== "EACCES") throw error;
+    // If the replacement state was hard-linked above, scrubbing the claimed
+    // name would corrupt the live pid file. Preserve the owner-only duplicate.
+  }
 }
 
 async function serve(port) {
@@ -379,14 +448,7 @@ async function serve(port) {
   const binding = ensureManagedRouterBinding({ paths, port });
   const routerToken = binding.routerToken;
   if (binding.updated) console.log(`${ts()} Updated the managed router URL for the active token and port`);
-  const storedProxy = readProxyUrl(paths.keyFile);
-  const proxyUrl = resolveProxy(process.env, storedProxy);
-  if (proxyUrl && !envProxySupported()) {
-    console.error(`${ts()} dscodex: proxy support requires Node.js >= 24.5 (found ${process.version}); ` +
-      "upgrade Node or clear the proxy (proxy clear)");
-    process.exitCode = 1;
-    return;
-  }
+  const proxyUrl = requireProxyRuntime(paths);
   // Node's fetch ignores proxy env vars unless --use-env-proxy is active.
   // Re-exec ourselves with the flag (and the resolved proxy in the env) so
   // `start`, autostart, and a manual `serve` all behave identically.
@@ -507,6 +569,7 @@ async function start(port) {
     console.log(`DSCodex is already running on ${HOST}:${port}`);
     return;
   }
+  requireProxyRuntime(paths);
   mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
   syncIfPossible(paths);
   const logFd = openSync(paths.log, "a", 0o600);
@@ -534,6 +597,65 @@ async function start(port) {
     }
   }
   throw new Error(`DSCodex did not become ready; inspect ${paths.log}`);
+}
+
+async function supervise(port) {
+  const { paths } = runtime();
+  await superviseRouter({
+    nodePath: nodePath(),
+    cliPath: fileURLToPath(import.meta.url),
+    port,
+    logPath: paths.log,
+  });
+}
+
+async function waitForHealth(port, routerToken, attempts = 50) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const ready = await health(port, routerToken);
+    if (ready) return ready;
+  }
+  return null;
+}
+
+async function waitForWindowsTaskState(expected, attempts = 100) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const info = windowsTaskInfo();
+    if (info?.state === expected) return info;
+    // Registration or the previous task instance may still be settling.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Windows task ${WINDOWS_TASK} did not reach state ${expected}`);
+}
+
+async function restoreManualRouter(paths, port, cause, rollback) {
+  const failures = [cause];
+  if (rollback) {
+    try {
+      await rollback();
+    } catch (rollbackError) {
+      failures.push(rollbackError);
+    }
+  }
+  try {
+    await start(port);
+  } catch (restoreError) {
+    failures.push(restoreError);
+    throw new AggregateError(
+      failures,
+      `Autostart failed and the previous manual router could not be restored; inspect ${paths.log}`,
+    );
+  }
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      "Autostart failed; the previous manual router was restored, but autostart rollback also failed",
+    );
+  }
+  throw new Error(
+    `Autostart failed; the previous manual router was restored: ${cause instanceof Error ? cause.message : String(cause)}`,
+    { cause },
+  );
 }
 
 async function stop() {
@@ -573,15 +695,91 @@ async function autostartEnable(paths, port) {
   const routerToken = binding.routerToken;
   if (binding.updated) console.log("Updated the managed router URL for the active token and port");
   mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
-
-  // Free the port so the manager-launched instance can bind immediately.
-  if (await health(port, routerToken)) {
-    await stopInstance(paths);
-    for (let attempt = 0; attempt < 30 && (await health(port, routerToken)); attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+  requireProxyRuntime(paths);
+  const wasRunning = Boolean(await health(port, routerToken));
+  if (kind === "schtasks") {
+    writeFileSync(file, encodeWindowsVbs(buildWindowsVbs({
+      nodePath: nodePath(),
+      cliPath,
+      port,
+      codexHome: dirname(paths.stateDir),
+    })), { mode: 0o600 });
+    // Register before touching a healthy manual router. A permissions/policy
+    // failure must never turn a failed autostart attempt into an outage.
+    execFileSync(powershellPath(), [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      buildWindowsRegisterScript({ taskName: WINDOWS_TASK, vbsPath: file }),
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    let manualStopped = false;
+    const rollback = async () => {
+      const failures = [];
+      if (manualStopped) {
+        // A task instance may have started but missed the readiness deadline.
+        // Stop it through the authenticated endpoint before removing its owner.
+        try {
+          await stopInstance(paths);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
+      } catch {
+        // The task may never have started.
+      }
+      try {
+        execFileSync("schtasks", ["/delete", "/tn", WINDOWS_TASK, "/f"], { stdio: ["ignore", "ignore", "pipe"] });
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        unlinkSync(file);
+      } catch (error) {
+        if (error?.code !== "ENOENT") failures.push(error);
+      }
+      if (failures.length) throw new AggregateError(failures, "Failed to roll back Windows autostart");
+    };
+    try {
+      if (wasRunning) {
+        await stopInstance(paths);
+        manualStopped = true;
+      }
+      // Register-ScheduledTask -Force can replace a definition while an older
+      // task instance is still running. End that stale owner only after a
+      // healthy router has been shut down through its authenticated endpoint.
+      if (windowsTaskInfo()?.state !== "Ready") {
+        try {
+          execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "pipe"] });
+        } catch {
+          // It may have completed between the state query and /end.
+        }
+      }
+      await waitForWindowsTaskState("Ready");
+      // Take effect now, not only at the next logon.
+      execFileSync("schtasks", ["/run", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "pipe"] });
+      const ready = await waitForHealth(port, routerToken);
+      if (!ready) throw new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
+      const task = windowsTaskInfo();
+      if (task?.state !== "Running") {
+        throw new Error(`Router started without a live scheduled supervisor (task state: ${task?.state ?? "missing"})`);
+      }
+      console.log(`DSCodex autostart enabled (${kind}); router running on ${HOST}:${port}`);
+      console.log(`DeepSeek key: ${ready.deepseek_key ? "configured" : "missing (resolves from the stored key at runtime)"}`);
+      return;
+    } catch (error) {
+      if (manualStopped || (wasRunning && !(await health(port, routerToken)))) {
+        return restoreManualRouter(paths, port, error, rollback);
+      }
+      await rollback();
+      throw error;
     }
   }
 
+  // launchd/systemd start the service during registration, so release the port
+  // immediately before handing ownership to the service manager.
+  if (wasRunning) await stopInstance(paths);
   if (kind === "launchd") {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, buildLaunchdPlist({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
@@ -591,13 +789,12 @@ async function autostartEnable(paths, port) {
     } catch {
       // Not loaded yet.
     }
-    execFileSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, file], { stdio: ["ignore", "ignore", "pipe"] });
-  } else if (kind === "schtasks") {
-    writeFileSync(file, buildWindowsVbs({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
-    const wscript = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "wscript.exe");
-    execFileSync("schtasks", ["/create", "/tn", WINDOWS_TASK, "/sc", "onlogon", "/rl", "limited", "/f", "/tr", `"${wscript}" "${file}"`], { stdio: ["ignore", "ignore", "pipe"] });
-    // Take effect now, not only at the next logon.
-    execFileSync("schtasks", ["/run", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "pipe"] });
+    try {
+      execFileSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, file], { stdio: ["ignore", "ignore", "pipe"] });
+    } catch (error) {
+      if (wasRunning) return restoreManualRouter(paths, port, error);
+      throw error;
+    }
   } else {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, buildSystemdUnit({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
@@ -605,26 +802,29 @@ async function autostartEnable(paths, port) {
       execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: ["ignore", "ignore", "pipe"] });
       execFileSync("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT], { stdio: ["ignore", "ignore", "pipe"] });
     } catch (error) {
-      throw new Error(`systemd user service unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      const wrapped = new Error(`systemd user service unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      if (wasRunning && !(await health(port, routerToken))) return restoreManualRouter(paths, port, wrapped);
+      throw wrapped;
     }
   }
 
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const ready = await health(port, routerToken);
-    if (ready) {
-      console.log(`DSCodex autostart enabled (${kind}); router running on ${HOST}:${port}`);
-      console.log(`DeepSeek key: ${ready.deepseek_key ? "configured" : "missing (resolves from the stored key at runtime)"}`);
-      return;
-    }
+  const ready = await waitForHealth(port, routerToken);
+  if (ready) {
+    console.log(`DSCodex autostart enabled (${kind}); router running on ${HOST}:${port}`);
+    console.log(`DeepSeek key: ${ready.deepseek_key ? "configured" : "missing (resolves from the stored key at runtime)"}`);
+    return;
   }
-  throw new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
+  const error = new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
+  if (wasRunning) return restoreManualRouter(paths, port, error);
+  throw error;
 }
 
-function autostartDisable(paths, { quiet = false } = {}) {
+async function autostartDisable(paths, { quiet = false } = {}) {
   const kind = autostartKind();
   const file = autostartFile(paths);
+  const wasEnabled = autostartEnabled(paths);
   let removed = false;
+  if (wasEnabled) await stopInstance(paths);
   if (kind === "launchd") {
     try {
       execFileSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCHD_LABEL}`], { stdio: ["ignore", "ignore", "ignore"] });
@@ -633,6 +833,11 @@ function autostartDisable(paths, { quiet = false } = {}) {
       // Not loaded.
     }
   } else if (kind === "schtasks") {
+    try {
+      execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
+    } catch {
+      // Task absent or already stopped.
+    }
     try {
       execFileSync("schtasks", ["/delete", "/tn", WINDOWS_TASK, "/f"], { stdio: ["ignore", "ignore", "ignore"] });
       removed = true;
@@ -669,9 +874,16 @@ async function autostartStatus(paths, port) {
   const kind = autostartKind();
   const enabled = autostartEnabled(paths);
   const ready = await health(port, readRouterToken(paths.keyFile));
-  console.log(`autostart: ${enabled ? `enabled (${kind}, port in config: see ${autostartFile(paths)})` : "not enabled"}`);
+  const task = kind === "schtasks" && enabled ? windowsTaskInfo() : null;
+  const taskStatus = task
+    ? `; task ${task.state}${task.state === "Running" ? "" : `, last result ${windowsTaskResult(task.lastTaskResult)}`}`
+    : "";
+  console.log(`autostart: ${enabled ? `enabled (${kind}${taskStatus}, port in config: see ${autostartFile(paths)})` : "not enabled"}`);
   console.log(`router: ${ready ? `running (${HOST}:${port})` : "stopped"}`);
-  if (!enabled) process.exitCode = 1;
+  if (enabled && ready && kind === "schtasks" && task?.state !== "Running") {
+    console.log("warning: the router is running manually; the scheduled supervisor is inactive");
+  }
+  if (!enabled || !ready || (kind === "schtasks" && task?.state !== "Running")) process.exitCode = 1;
 }
 
 async function manageAutostart(subcommand, paths, port) {
@@ -750,7 +962,7 @@ async function doctor(port) {
       catalogPath: paths.catalog,
       routerToken,
     }),
-    catalog_present: existsSync(paths.catalog),
+    catalog_present: existsSync(paths.catalog) && catalogReady(paths),
     router_token_present: Boolean(routerToken),
     proxy_running: Boolean(ready),
     deepseek_key_in_proxy: Boolean(ready?.deepseek_key),
@@ -827,13 +1039,14 @@ async function main() {
     case "proxy": await manageProxy(args[0] ?? "status", args.slice(1), paths, port); break;
     case "start": await start(port); break;
     case "serve": await serve(port); break;
+    case "supervise": await supervise(port); break;
     case "autostart": await manageAutostart(args[0] ?? "status", paths, port); break;
     case "bridge": await manageBridge(args[0] ?? "status", paths); break;
     case "status": await status(port); break;
     case "doctor": await doctor(port); break;
     case "stop": await stop(); break;
     case "uninstall":
-      autostartDisable(paths, { quiet: true });
+      await autostartDisable(paths, { quiet: true });
       await stop();
       uninstall({ paths });
       deactivateBridge(paths);

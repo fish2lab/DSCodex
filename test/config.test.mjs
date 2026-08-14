@@ -39,11 +39,16 @@ test("runtime version matches package metadata", () => {
 });
 
 test("catalog backfills newly required fields on stale native cache entries", () => {
-  const catalog = buildCatalog({ models: [TEMPLATE] });
+  const staleTemplate = { ...TEMPLATE };
+  delete staleTemplate.base_instructions;
+  const catalog = buildCatalog({ models: [staleTemplate] });
   const native = catalog.models.find((model) => model.slug === "gpt-5.6-sol");
   assert.equal(native.supports_reasoning_summaries, false);
+  assert.equal(native.prefer_websockets, false);
+  assert.equal(native.base_instructions, TEMPLATE.model_messages.instructions_template);
   const deepseek = catalog.models.find((model) => model.slug === "deepseek/deepseek-v4-flash");
   assert.equal(deepseek.supports_reasoning_summaries, false);
+  assert.equal(deepseek.base_instructions, "You are Codex, powered by DeepSeek V4 Flash.");
 });
 
 test("catalog adds distinct whale-labelled V4 Flash and Pro entries", () => {
