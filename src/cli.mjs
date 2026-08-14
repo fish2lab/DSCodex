@@ -16,7 +16,7 @@ import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { buildCatalog, syncCatalog } from "./catalog.mjs";
+import { buildCatalog, isCatalogReady, syncCatalog } from "./catalog.mjs";
 import {
   ensureManagedRouterBinding,
   install,
@@ -41,7 +41,13 @@ import {
   validateProxyUrl,
 } from "./proxy-config.mjs";
 import { createProxyServer } from "./proxy.mjs";
-import { superviseRouter } from "./supervisor.mjs";
+import {
+  authenticateSupervisorOwner,
+  readSupervisorState,
+  removeSupervisorState,
+  requestSupervisorStop,
+  superviseRouter,
+} from "./supervisor.mjs";
 import {
   LAUNCHD_LABEL,
   SYSTEMD_UNIT,
@@ -51,6 +57,7 @@ import {
   buildSystemdUnit,
   buildWindowsRegisterScript,
   buildWindowsVbs,
+  cleanupAutostart,
   encodeWindowsVbs,
   launchdPlistPath,
   systemdUnitPath,
@@ -342,11 +349,7 @@ function loadModels(paths) {
 
 function catalogReady(paths) {
   try {
-    const models = loadModels(paths);
-    return models.length > 0 && models.every((model) => (
-      typeof model?.slug === "string"
-      && typeof model.base_instructions === "string"
-    ));
+    return isCatalogReady({ models: loadModels(paths) });
   } catch {
     return false;
   }
@@ -523,7 +526,7 @@ async function serve(port) {
   });
 }
 
-async function stopInstance(paths) {
+async function stopRouterInstance(paths) {
   const state = readPidState(paths);
   if (!state) return "none";
   const expected = { pid: state.pid, instanceId: state.instanceId };
@@ -557,6 +560,113 @@ async function stopInstance(paths) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Router PID ${state.pid} did not exit after authenticated shutdown`);
+}
+
+function sameSupervisor(left, right) {
+  return left?.pid === right?.pid && left?.instanceId === right?.instanceId;
+}
+
+async function stopInstance(paths) {
+  const failures = [];
+  const attemptedRouters = new Set();
+  let supervisor = null;
+  let sawSupervisor = false;
+  let result = "none";
+
+  try {
+    supervisor = readSupervisorState(paths.log);
+    if (supervisor) {
+      sawSupervisor = true;
+      // The request is scoped to this exact random instance token and never
+      // signals the PID. Leave it even when the fresh liveness challenge times
+      // out: a temporarily stalled real owner will honor it when it resumes,
+      // while a recycled unrelated PID cannot observe or act on it.
+      requestSupervisorStop(paths.log, supervisor);
+      if (!(await authenticateSupervisorOwner(paths.log, supervisor))) {
+        removeSupervisorState(paths.log, supervisor);
+        supervisor = null;
+      }
+    }
+  } catch (error) {
+    failures.push(error);
+  }
+
+  try {
+    const state = readPidState(paths);
+    if (state) attemptedRouters.add(state.instanceId);
+    result = await stopRouterInstance(paths);
+  } catch (error) {
+    failures.push(error);
+  }
+
+  // A stop request can race with a supervised child publishing server.pid.
+  // Keep watching the authenticated supervisor instance and, if a fresh child
+  // appears, stop that child through the normal authenticated HTTP endpoint.
+  if (supervisor) {
+    let supervisorStopped = false;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      let current;
+      try {
+        current = readSupervisorState(paths.log);
+      } catch (error) {
+        failures.push(error);
+        break;
+      }
+      if (!current) {
+        supervisorStopped = true;
+        break;
+      }
+      if (!sameSupervisor(current, supervisor)) {
+        supervisor = current;
+        sawSupervisor = true;
+        try {
+          requestSupervisorStop(paths.log, current);
+        } catch (error) {
+          failures.push(error);
+          break;
+        }
+      }
+      let supervisorAuthenticated;
+      try {
+        supervisorAuthenticated = await authenticateSupervisorOwner(paths.log, current);
+      } catch (error) {
+        failures.push(error);
+        break;
+      }
+      if (!supervisorAuthenticated) {
+        try {
+          removeSupervisorState(paths.log, current);
+        } catch (error) {
+          failures.push(error);
+        }
+        // Re-read on the next pass: a replacement may have published between
+        // the failed challenge and conditional cleanup of this generation.
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        continue;
+      }
+      try {
+        const router = readPidState(paths);
+        if (router && !attemptedRouters.has(router.instanceId)) {
+          attemptedRouters.add(router.instanceId);
+          result = await stopRouterInstance(paths);
+        }
+      } catch (error) {
+        failures.push(error);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!supervisorStopped) {
+      failures.push(new Error(`Supervisor PID ${supervisor.pid} did not acknowledge the authenticated stop request`));
+    }
+  }
+
+  if (failures.length) {
+    throw new AggregateError(failures, failures.map((error) => (
+      error instanceof Error ? error.message : String(error)
+    )).join("; "));
+  }
+  return sawSupervisor && (result === "none" || result === "stale") ? "stopped" : result;
 }
 
 async function start(port) {
@@ -629,33 +739,40 @@ async function waitForWindowsTaskState(expected, attempts = 100) {
 }
 
 async function restoreManualRouter(paths, port, cause, rollback) {
-  const failures = [cause];
   if (rollback) {
     try {
       await rollback();
     } catch (rollbackError) {
-      failures.push(rollbackError);
+      throw new AggregateError(
+        [cause, rollbackError],
+        `Autostart failed and rollback was incomplete, so the previous manual router was not restarted: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+      );
     }
   }
   try {
     await start(port);
   } catch (restoreError) {
-    failures.push(restoreError);
     throw new AggregateError(
-      failures,
-      `Autostart failed and the previous manual router could not be restored; inspect ${paths.log}`,
-    );
-  }
-  if (failures.length > 1) {
-    throw new AggregateError(
-      failures,
-      "Autostart failed; the previous manual router was restored, but autostart rollback also failed",
+      [cause, restoreError],
+      `Autostart failed and the previous manual router could not be restored; inspect ${paths.log}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
     );
   }
   throw new Error(
     `Autostart failed; the previous manual router was restored: ${cause instanceof Error ? cause.message : String(cause)}`,
     { cause },
   );
+}
+
+async function throwAfterRollback(cause, rollback) {
+  try {
+    await rollback();
+  } catch (rollbackError) {
+    throw new AggregateError(
+      [cause, rollbackError],
+      `Autostart failed and rollback was incomplete: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+    );
+  }
+  throw cause;
 }
 
 async function stop() {
@@ -673,16 +790,107 @@ function autostartFile(paths) {
   return join(paths.stateDir, "autostart-run.vbs");
 }
 
+function windowsTaskExists() {
+  try {
+    execFileSync("schtasks", ["/query", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function autostartEnabled(paths) {
-  if (autostartKind() === "schtasks") {
-    try {
-      execFileSync("schtasks", ["/query", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
-      return true;
-    } catch {
-      return false;
+  if (autostartKind() === "schtasks") return windowsTaskExists();
+  return existsSync(autostartFile(paths));
+}
+
+function launchdLoaded(uid) {
+  try {
+    execFileSync("/bin/launchctl", ["print", `gui/${uid}/${LAUNCHD_LABEL}`], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function bootoutLaunchd(uid) {
+  if (!launchdLoaded(uid)) return;
+  try {
+    execFileSync("/bin/launchctl", ["bootout", `gui/${uid}/${LAUNCHD_LABEL}`], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+  } catch (error) {
+    // A service can finish between print and bootout; only surface the error if
+    // launchd still reports that our label is loaded.
+    if (launchdLoaded(uid)) throw error;
+  }
+}
+
+function removeAutostartArtifact(file) {
+  try {
+    unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function deactivateWindowsTask() {
+  const failures = [];
+  try {
+    execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
+  } catch (error) {
+    if (windowsTaskInfo()?.state === "Running") failures.push(error);
+  }
+  try {
+    execFileSync("schtasks", ["/delete", "/tn", WINDOWS_TASK, "/f"], { stdio: ["ignore", "ignore", "pipe"] });
+  } catch (error) {
+    if (windowsTaskExists()) failures.push(error);
+  }
+  if (failures.length) {
+    throw new AggregateError(failures, failures.map((error) => (
+      error instanceof Error ? error.message : String(error)
+    )).join("; "));
+  }
+}
+
+async function cleanupManagedAutostart(paths, {
+  kind,
+  file,
+  stopRouter = false,
+  deactivateManager = true,
+  managerExpected = false,
+  message,
+}) {
+  const uid = kind === "launchd" ? process.getuid() : null;
+  let managerCleanup = null;
+  if (deactivateManager) {
+    if (kind === "launchd") {
+      managerCleanup = () => bootoutLaunchd(uid);
+    } else if (kind === "schtasks") {
+      managerCleanup = () => deactivateWindowsTask();
+    } else {
+      managerCleanup = () => {
+        try {
+          execFileSync("systemctl", ["--user", "disable", "--now", SYSTEMD_UNIT], {
+            stdio: ["ignore", "ignore", "pipe"],
+          });
+        } catch (error) {
+          if (managerExpected) throw error;
+        }
+      };
     }
   }
-  return existsSync(autostartFile(paths));
+  await cleanupAutostart({
+    stopRouter: stopRouter ? () => stopInstance(paths) : null,
+    deactivateManager: managerCleanup,
+    removeArtifact: () => removeAutostartArtifact(file),
+    reloadManager: kind === "systemd" && managerExpected
+      ? () => execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: ["ignore", "ignore", "pipe"] })
+      : null,
+    message,
+  });
 }
 
 // The generated plist/unit/VBS never embeds the DeepSeek key: the router resolves
@@ -698,6 +906,8 @@ async function autostartEnable(paths, port) {
   requireProxyRuntime(paths);
   const wasRunning = Boolean(await health(port, routerToken));
   if (kind === "schtasks") {
+    const previousTaskExisted = autostartEnabled(paths);
+    const previousArtifact = existsSync(file) ? readFileSync(file) : null;
     writeFileSync(file, encodeWindowsVbs(buildWindowsVbs({
       nodePath: nodePath(),
       cliPath,
@@ -706,41 +916,40 @@ async function autostartEnable(paths, port) {
     })), { mode: 0o600 });
     // Register before touching a healthy manual router. A permissions/policy
     // failure must never turn a failed autostart attempt into an outage.
-    execFileSync(powershellPath(), [
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      buildWindowsRegisterScript({ taskName: WINDOWS_TASK, vbsPath: file }),
-    ], { stdio: ["ignore", "ignore", "pipe"] });
+    try {
+      execFileSync(powershellPath(), [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        buildWindowsRegisterScript({ taskName: WINDOWS_TASK, vbsPath: file }),
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+    } catch (error) {
+      const restorePreviousArtifact = async () => {
+        if (previousArtifact) writeFileSync(file, previousArtifact, { mode: 0o600 });
+        else removeAutostartArtifact(file);
+      };
+      // Never delete a task that existed before this registration attempt. If
+      // there was no previous task, clean up only when a post-failure query can
+      // positively identify a partially registered new task.
+      const rollbackRegistration = !previousTaskExisted && autostartEnabled(paths)
+        ? () => cleanupManagedAutostart(paths, {
+            kind,
+            file,
+            managerExpected: true,
+            message: "Failed to roll back Windows autostart registration",
+          })
+        : restorePreviousArtifact;
+      return throwAfterRollback(error, rollbackRegistration);
+    }
     let manualStopped = false;
-    const rollback = async () => {
-      const failures = [];
-      if (manualStopped) {
-        // A task instance may have started but missed the readiness deadline.
-        // Stop it through the authenticated endpoint before removing its owner.
-        try {
-          await stopInstance(paths);
-        } catch (error) {
-          failures.push(error);
-        }
-      }
-      try {
-        execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
-      } catch {
-        // The task may never have started.
-      }
-      try {
-        execFileSync("schtasks", ["/delete", "/tn", WINDOWS_TASK, "/f"], { stdio: ["ignore", "ignore", "pipe"] });
-      } catch (error) {
-        failures.push(error);
-      }
-      try {
-        unlinkSync(file);
-      } catch (error) {
-        if (error?.code !== "ENOENT") failures.push(error);
-      }
-      if (failures.length) throw new AggregateError(failures, "Failed to roll back Windows autostart");
-    };
+    let taskStarted = false;
+    const rollback = () => cleanupManagedAutostart(paths, {
+      kind,
+      file,
+      stopRouter: taskStarted,
+      managerExpected: true,
+      message: "Failed to roll back Windows autostart",
+    });
     try {
       if (wasRunning) {
         await stopInstance(paths);
@@ -759,6 +968,7 @@ async function autostartEnable(paths, port) {
       await waitForWindowsTaskState("Ready");
       // Take effect now, not only at the next logon.
       execFileSync("schtasks", ["/run", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "pipe"] });
+      taskStarted = true;
       const ready = await waitForHealth(port, routerToken);
       if (!ready) throw new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
       const task = windowsTaskInfo();
@@ -772,95 +982,70 @@ async function autostartEnable(paths, port) {
       if (manualStopped || (wasRunning && !(await health(port, routerToken)))) {
         return restoreManualRouter(paths, port, error, rollback);
       }
-      await rollback();
-      throw error;
+      return throwAfterRollback(error, rollback);
     }
   }
 
   // launchd/systemd start the service during registration, so release the port
   // immediately before handing ownership to the service manager.
-  if (wasRunning) await stopInstance(paths);
-  if (kind === "launchd") {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, buildLaunchdPlist({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
-    const uid = process.getuid();
-    try {
-      execFileSync("/bin/launchctl", ["bootout", `gui/${uid}/${LAUNCHD_LABEL}`], { stdio: ["ignore", "ignore", "ignore"] });
-    } catch {
-      // Not loaded yet.
+  let manualStopped = false;
+  let managerActivationAttempted = false;
+  const rollback = () => cleanupManagedAutostart(paths, {
+    kind,
+    file,
+    stopRouter: managerActivationAttempted,
+    deactivateManager: managerActivationAttempted,
+    managerExpected: managerActivationAttempted,
+    message: `Failed to roll back ${kind} autostart`,
+  });
+  try {
+    if (wasRunning) {
+      await stopInstance(paths);
+      manualStopped = true;
     }
-    try {
+    if (kind === "launchd") {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, buildLaunchdPlist({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
+      const uid = process.getuid();
+      bootoutLaunchd(uid);
+      managerActivationAttempted = true;
       execFileSync("/bin/launchctl", ["bootstrap", `gui/${uid}`, file], { stdio: ["ignore", "ignore", "pipe"] });
-    } catch (error) {
-      if (wasRunning) return restoreManualRouter(paths, port, error);
-      throw error;
-    }
-  } else {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, buildSystemdUnit({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
-    try {
+    } else {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, buildSystemdUnit({ nodePath: nodePath(), cliPath, port, logPath: paths.log }), { mode: 0o600 });
       execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: ["ignore", "ignore", "pipe"] });
-      execFileSync("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT], { stdio: ["ignore", "ignore", "pipe"] });
-    } catch (error) {
-      const wrapped = new Error(`systemd user service unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-      if (wasRunning && !(await health(port, routerToken))) return restoreManualRouter(paths, port, wrapped);
-      throw wrapped;
+      try {
+        managerActivationAttempted = true;
+        execFileSync("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT], { stdio: ["ignore", "ignore", "pipe"] });
+      } catch (error) {
+        throw new Error(`systemd user service unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
     }
-  }
 
-  const ready = await waitForHealth(port, routerToken);
-  if (ready) {
+    const ready = await waitForHealth(port, routerToken);
+    if (!ready) throw new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
     console.log(`DSCodex autostart enabled (${kind}); router running on ${HOST}:${port}`);
     console.log(`DeepSeek key: ${ready.deepseek_key ? "configured" : "missing (resolves from the stored key at runtime)"}`);
-    return;
+  } catch (error) {
+    if (manualStopped || (wasRunning && !(await health(port, routerToken)))) {
+      return restoreManualRouter(paths, port, error, rollback);
+    }
+    return throwAfterRollback(error, rollback);
   }
-  const error = new Error(`Autostart is installed but the router did not become ready; inspect ${paths.log}`);
-  if (wasRunning) return restoreManualRouter(paths, port, error);
-  throw error;
 }
 
 async function autostartDisable(paths, { quiet = false } = {}) {
   const kind = autostartKind();
   const file = autostartFile(paths);
   const wasEnabled = autostartEnabled(paths);
-  let removed = false;
-  if (wasEnabled) await stopInstance(paths);
-  if (kind === "launchd") {
-    try {
-      execFileSync("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LAUNCHD_LABEL}`], { stdio: ["ignore", "ignore", "ignore"] });
-      removed = true;
-    } catch {
-      // Not loaded.
-    }
-  } else if (kind === "schtasks") {
-    try {
-      execFileSync("schtasks", ["/end", "/tn", WINDOWS_TASK], { stdio: ["ignore", "ignore", "ignore"] });
-    } catch {
-      // Task absent or already stopped.
-    }
-    try {
-      execFileSync("schtasks", ["/delete", "/tn", WINDOWS_TASK, "/f"], { stdio: ["ignore", "ignore", "ignore"] });
-      removed = true;
-    } catch {
-      // Task absent.
-    }
-  } else {
-    try {
-      execFileSync("systemctl", ["--user", "disable", "--now", SYSTEMD_UNIT], { stdio: ["ignore", "ignore", "ignore"] });
-      removed = true;
-    } catch {
-      // Unit absent or systemd unavailable.
-    }
-    try {
-      execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: ["ignore", "ignore", "ignore"] });
-    } catch {
-      // Best effort.
-    }
-  }
-  if (existsSync(file)) {
-    unlinkSync(file);
-    removed = true;
-  }
+  const removed = wasEnabled || existsSync(file);
+  await cleanupManagedAutostart(paths, {
+    kind,
+    file,
+    stopRouter: wasEnabled,
+    managerExpected: wasEnabled,
+    message: `DSCodex autostart cleanup encountered errors (${kind})`,
+  });
   if (quiet) return;
   if (removed) {
     console.log(`DSCodex autostart disabled (${kind}); the managed router was stopped`);
@@ -1007,6 +1192,33 @@ The router re-execs itself with Node's --use-env-proxy (Node >= 24.5); loopback 
 api.deepseek.com stay outside the proxy while GPT passthrough and vision use it.`);
 }
 
+async function uninstallAll(paths) {
+  const failures = [];
+  const operations = [
+    () => autostartDisable(paths, { quiet: true }),
+    () => stopInstance(paths),
+    () => uninstall({ paths }),
+    () => deactivateBridge(paths),
+  ];
+  for (const operation of operations) {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) {
+    const details = failures.map((error) => (
+      error instanceof Error ? error.message : String(error)
+    )).join("; ");
+    throw new AggregateError(
+      failures,
+      `Uninstall completed all possible cleanup steps but encountered errors: ${details}`,
+    );
+  }
+  console.log("Removed DSCodex-owned config, catalog, selection state, autostart entry, and app-server bridge");
+}
+
 async function main() {
   const [command = "help", ...args] = process.argv.slice(2);
   const port = parsePort(args);
@@ -1045,13 +1257,7 @@ async function main() {
     case "status": await status(port); break;
     case "doctor": await doctor(port); break;
     case "stop": await stop(); break;
-    case "uninstall":
-      await autostartDisable(paths, { quiet: true });
-      await stop();
-      uninstall({ paths });
-      deactivateBridge(paths);
-      console.log("Removed DSCodex-owned config, catalog, selection state, autostart entry, and app-server bridge");
-      break;
+    case "uninstall": await uninstallAll(paths); break;
     case "--version":
     case "version": console.log(VERSION); break;
     case "help":

@@ -7,6 +7,33 @@ export const WINDOWS_TASK = "DSCodex";
 export const WINDOWS_RESTART_COUNT = 255;
 export const WINDOWS_RESTART_INTERVAL_MINUTES = 1;
 
+// Cleanup must remain best-effort: a corrupt pid file or failed authenticated
+// shutdown cannot prevent the service manager and generated artifact from being
+// removed. Report every failure only after all requested steps have run.
+export async function cleanupAutostart({
+  stopRouter,
+  deactivateManager,
+  removeArtifact,
+  reloadManager,
+  message = "Failed to clean up DSCodex autostart",
+}) {
+  const failures = [];
+  for (const operation of [stopRouter, deactivateManager, removeArtifact, reloadManager]) {
+    if (!operation) continue;
+    try {
+      await operation();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) {
+    const details = failures.map((error) => (
+      error instanceof Error ? error.message : String(error)
+    )).join("; ");
+    throw new AggregateError(failures, `${message}: ${details}`);
+  }
+}
+
 export function autostartKind(platform = process.platform) {
   if (platform === "darwin") return "launchd";
   if (platform === "win32") return "schtasks";

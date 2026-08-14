@@ -13,11 +13,13 @@ import {
   buildSystemdUnit,
   buildWindowsRegisterScript,
   buildWindowsVbs,
+  cleanupAutostart,
   encodeWindowsVbs,
 } from "../src/autostart.mjs";
 import { buildInstalledConfig } from "../src/config.mjs";
 import { pathsFor } from "../src/constants.mjs";
 import { ensureRouterToken } from "../src/keys.mjs";
+import { supervisorStatePath } from "../src/supervisor.mjs";
 
 const CLI = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 const SUPERVISOR_FIXTURE_SOURCE = [
@@ -94,6 +96,64 @@ function runCli(args, env) {
   });
 }
 
+async function waitForText(path, pattern, message) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (existsSync(path) && pattern.test(readFileSync(path, "utf8"))) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${message}`);
+}
+
+function fakeWindowsTaskHook(temp) {
+  const hook = join(temp, "fake-schtasks.cjs");
+  const taskLog = join(temp, "task-operations.jsonl");
+  writeFileSync(hook, [
+    'const fs = require("node:fs");',
+    'const childProcess = require("node:child_process");',
+    'const { syncBuiltinESMExports } = require("node:module");',
+    'const original = childProcess.execFileSync;',
+    'childProcess.execFileSync = function(file, args, options) {',
+    '  if (String(file).toLowerCase() === "schtasks") {',
+    '    fs.appendFileSync(process.env.DSCODEX_TEST_TASK_LOG, `${JSON.stringify(args)}\\n`);',
+    '    const action = String(args?.[0]).toLowerCase();',
+    '    if (process.env.DSCODEX_TEST_FAKE_TASK === "1" && action === "/query"',
+    '        && !fs.existsSync(process.env.DSCODEX_TEST_TASK_STATE)) {',
+    '      throw new Error("simulated missing task");',
+    '    }',
+    '    if (String(args?.[0]).toLowerCase() === "/run" && process.env.DSCODEX_TEST_TASK_CLI) {',
+    '      const child = childProcess.spawn(process.execPath, [',
+    '        process.env.DSCODEX_TEST_TASK_CLI, "serve", "--port", process.env.DSCODEX_TEST_TASK_PORT,',
+    '      ], { env: process.env, detached: true, stdio: "ignore", windowsHide: true });',
+    '      child.unref();',
+    '    }',
+    '    if (process.env.DSCODEX_TEST_FAKE_TASK === "1" && action === "/delete") {',
+    '      try { fs.unlinkSync(process.env.DSCODEX_TEST_TASK_STATE); } catch {}',
+    '    }',
+    '    return options?.encoding ? "" : Buffer.alloc(0);',
+    '  }',
+    '  if (process.env.DSCODEX_TEST_FAIL_POWERSHELL === "1"',
+    '      && String(file).toLowerCase().endsWith("powershell.exe")) {',
+    '    throw new Error("simulated registration failure");',
+    '  }',
+    '  if (process.env.DSCODEX_TEST_FAKE_TASK === "1"',
+    '      && String(file).toLowerCase().endsWith("powershell.exe")) {',
+    '    const command = String(args?.at(-1) ?? "");',
+    '    if (command.includes("Register-ScheduledTask")) {',
+    '      fs.writeFileSync(process.env.DSCODEX_TEST_TASK_STATE, "registered");',
+    '    }',
+    '    const output = command.includes("Get-ScheduledTask")',
+    '      ? JSON.stringify({ state: "Ready", lastTaskResult: 0 })',
+    '      : "";',
+    '    return options?.encoding ? output : Buffer.from(output);',
+    '  }',
+    '  return original.apply(this, arguments);',
+    '};',
+    'syncBuiltinESMExports();',
+    '',
+  ].join("\n"));
+  return { hook, taskLog };
+}
+
 test("launchd plist embeds absolute paths and restarts only on failure", () => {
   const plist = buildLaunchdPlist({
     nodePath: "/opt/homebrew/bin/node",
@@ -151,6 +211,33 @@ test("windows vbs waits for the hidden Node supervisor and quotes paths safely",
   assert.ok(!vbs.includes("powershell"));
   assert.ok(!vbs.includes("Out-File"));
   assert.ok(!vbs.includes("cmd /c"));
+});
+
+test("autostart cleanup runs every step and aggregates failures", async () => {
+  const calls = [];
+  let thrown;
+  try {
+    await cleanupAutostart({
+      stopRouter: () => {
+        calls.push("stop");
+        throw new Error("invalid pid state");
+      },
+      deactivateManager: () => {
+        calls.push("deactivate");
+        throw new Error("manager delete failed");
+      },
+      removeArtifact: () => calls.push("remove"),
+      reloadManager: () => calls.push("reload"),
+      message: "cleanup failed",
+    });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof AggregateError);
+  assert.deepEqual(calls, ["stop", "deactivate", "remove", "reload"]);
+  assert.equal(thrown.errors.length, 2);
+  assert.match(thrown.message, /invalid pid state/);
+  assert.match(thrown.message, /manager delete failed/);
 });
 
 test("windows task registration is user-scoped and restarts router crashes", () => {
@@ -285,6 +372,219 @@ test("failed Windows autostart registration leaves a healthy manual router runni
   } finally {
     await runCli(["stop", "--port", String(port)], env);
     child.kill("SIGKILL");
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("failed Windows task replacement preserves the existing task and VBS", {
+  skip: process.platform !== "win32" ? "Windows manager integration test" : false,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-autostart-existing-task-"));
+  const paths = prepareRouterHome(codexHome, 10110);
+  const vbsPath = join(paths.stateDir, "autostart-run.vbs");
+  const previousVbs = Buffer.from("existing task shim", "utf8");
+  const { hook, taskLog } = fakeWindowsTaskHook(codexHome);
+  writeFileSync(vbsPath, previousVbs);
+  try {
+    const result = await runCli(["autostart", "enable"], {
+      ...routerEnv(codexHome),
+      NODE_OPTIONS: `--require=${hook}`,
+      DSCODEX_TEST_TASK_LOG: taskLog,
+      DSCODEX_TEST_FAIL_POWERSHELL: "1",
+    });
+    assert.notEqual(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /simulated registration failure/);
+    assert.deepEqual(readFileSync(vbsPath), previousVbs);
+    const operations = readFileSync(taskLog, "utf8");
+    assert.doesNotMatch(operations, /"\/end"|"\/delete"/i);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("Windows rollback stops a newly started task router when no manual router existed", {
+  timeout: 20_000,
+  skip: process.platform !== "win32" ? "Windows manager integration test" : false,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-autostart-new-task-rollback-"));
+  const port = 20_000 + Math.floor(Math.random() * 20_000);
+  const paths = prepareRouterHome(codexHome, port);
+  const { hook, taskLog } = fakeWindowsTaskHook(codexHome);
+  const env = {
+    ...routerEnv(codexHome),
+    NODE_OPTIONS: `--require=${hook}`,
+    DSCODEX_TEST_TASK_LOG: taskLog,
+    DSCODEX_TEST_TASK_STATE: join(codexHome, "fake-task.state"),
+    DSCODEX_TEST_FAKE_TASK: "1",
+    DSCODEX_TEST_TASK_CLI: CLI,
+    DSCODEX_TEST_TASK_PORT: String(port),
+  };
+  try {
+    const result = await runCli(["autostart", "enable", "--port", String(port)], env);
+    assert.notEqual(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /without a live scheduled supervisor/);
+    await waitForPortToClose(port);
+    assert.equal(existsSync(paths.pid), false);
+    assert.equal(existsSync(join(paths.stateDir, "autostart-run.vbs")), false);
+    const operations = readFileSync(taskLog, "utf8");
+    assert.match(operations, /"\/run"/i);
+    assert.match(operations, /"\/end"/i);
+    assert.match(operations, /"\/delete"/i);
+  } finally {
+    try { await runCli(["stop", "--port", String(port)], env); } catch {}
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("autostart disable removes the Windows manager and artifact after a pid-state failure", {
+  skip: process.platform !== "win32" ? "Windows manager integration test" : false,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-autostart-disable-corrupt-"));
+  const paths = prepareRouterHome(codexHome, 10110);
+  const vbsPath = join(paths.stateDir, "autostart-run.vbs");
+  const { hook, taskLog } = fakeWindowsTaskHook(codexHome);
+  writeFileSync(vbsPath, "fixture");
+  writeFileSync(paths.pid, "not trusted json\n");
+  try {
+    const result = await runCli(["autostart", "disable"], {
+      ...routerEnv(codexHome),
+      NODE_OPTIONS: `--require=${hook}`,
+      DSCODEX_TEST_TASK_LOG: taskLog,
+    });
+    assert.notEqual(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /Invalid DSCodex pid state/);
+    assert.equal(existsSync(vbsPath), false);
+    const operations = readFileSync(taskLog, "utf8");
+    assert.match(operations, /"\/end"/i);
+    assert.match(operations, /"\/delete"/i);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("uninstall continues config cleanup after autostart and pid-state failures", {
+  skip: process.platform !== "win32" ? "Windows manager integration test" : false,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-uninstall-corrupt-"));
+  const paths = prepareRouterHome(codexHome, 10110);
+  const vbsPath = join(paths.stateDir, "autostart-run.vbs");
+  const { hook, taskLog } = fakeWindowsTaskHook(codexHome);
+  writeFileSync(vbsPath, "fixture");
+  writeFileSync(paths.pid, "not trusted json\n");
+  writeFileSync(paths.catalog, '{"models":[]}\n');
+  writeFileSync(paths.selectionState, "{}\n");
+  try {
+    const result = await runCli(["uninstall"], {
+      ...routerEnv(codexHome),
+      NODE_OPTIONS: `--require=${hook}`,
+      DSCODEX_TEST_TASK_LOG: taskLog,
+    });
+    assert.notEqual(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /Uninstall completed all possible cleanup steps/);
+    assert.equal(existsSync(vbsPath), false);
+    assert.equal(existsSync(paths.catalog), false);
+    assert.equal(existsSync(paths.keyFile), false);
+    assert.equal(existsSync(paths.selectionState), false);
+    assert.doesNotMatch(readFileSync(paths.config, "utf8"), /DSCodex managed/);
+    const operations = readFileSync(taskLog, "utf8");
+    assert.match(operations, /"\/delete"/i);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("stop treats a reused live supervisor PID without an authenticated owner as stale", {
+  timeout: 12_000,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-supervisor-reused-pid-stop-"));
+  const paths = prepareRouterHome(codexHome, 10110);
+  const stale = {
+    pid: process.pid,
+    instanceId: `${process.pid}-${Date.now()}-0123456789abcdef`,
+    stopToken: "A".repeat(43),
+  };
+  writeFileSync(supervisorStatePath(paths.log), `${JSON.stringify(stale)}\n`);
+  try {
+    const stopped = await runCli(["stop"], routerEnv(codexHome));
+    assert.equal(stopped.code, 0, `${stopped.stdout}\n${stopped.stderr}`);
+    assert.match(stopped.stdout, /Stopped DSCodex/);
+    assert.equal(existsSync(supervisorStatePath(paths.log)), false);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("stop keeps a supervised router down when invoked during crash backoff", {
+  timeout: 15_000,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-supervised-stop-"));
+  const blocker = createServer((_request, response) => response.end());
+  blocker.listen(0, "127.0.0.1");
+  await once(blocker, "listening");
+  const port = blocker.address().port;
+  const paths = prepareRouterHome(codexHome, port);
+  const env = routerEnv(codexHome);
+  const supervisor = spawn(process.execPath, [CLI, "supervise", "--port", String(port)], {
+    env,
+    stdio: "ignore",
+  });
+  const supervisorExited = once(supervisor, "exit");
+  try {
+    await waitForFile(supervisorStatePath(paths.log), "supervisor pid state");
+    await waitForText(paths.log, /restarting in 2000ms/, "supervisor crash backoff");
+
+    const stopped = await runCli(["stop", "--port", String(port)], env);
+    assert.equal(stopped.code, 0, `${stopped.stdout}\n${stopped.stderr}`);
+    assert.match(stopped.stdout, /Stopped DSCodex/);
+    const [code, signal] = await supervisorExited;
+    assert.equal(code, 0);
+    assert.equal(signal, null);
+
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    assert.equal(existsSync(supervisorStatePath(paths.log)), false);
+    assert.equal(existsSync(paths.pid), false);
+  } finally {
+    supervisor.kill("SIGKILL");
+    blocker.closeAllConnections?.();
+    await new Promise((resolve) => blocker.close(resolve));
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("stop cleanly shuts down a live supervised router and its supervisor", {
+  timeout: 15_000,
+}, async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-supervised-live-stop-"));
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const port = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+
+  const paths = prepareRouterHome(codexHome, port);
+  const env = routerEnv(codexHome);
+  const supervisor = spawn(process.execPath, [CLI, "supervise", "--port", String(port)], {
+    env,
+    stdio: "ignore",
+  });
+  const supervisorExited = once(supervisor, "exit");
+  try {
+    await waitForFile(supervisorStatePath(paths.log), "supervisor pid state");
+    await waitForFile(paths.pid, "router pid state");
+
+    const stopped = await runCli(["stop", "--port", String(port)], env);
+    assert.equal(stopped.code, 0, `${stopped.stdout}\n${stopped.stderr}`);
+    assert.match(stopped.stdout, /Stopped DSCodex/);
+
+    const [code, signal] = await supervisorExited;
+    assert.equal(code, 0);
+    assert.equal(signal, null);
+    await waitForPortToClose(port);
+    assert.equal(existsSync(supervisorStatePath(paths.log)), false);
+    assert.equal(existsSync(paths.pid), false);
+  } finally {
+    supervisor.kill("SIGKILL");
+    try { await runCli(["stop", "--port", String(port)], env); } catch {}
     rmSync(codexHome, { recursive: true, force: true });
   }
 });

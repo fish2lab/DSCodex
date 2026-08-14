@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { buildCatalog } from "../src/catalog.mjs";
+import { buildCatalog, isCatalogReady } from "../src/catalog.mjs";
 import {
   buildInstalledConfig,
   ensureManagedRouterBinding,
@@ -67,6 +67,49 @@ test("catalog adds distinct whale-labelled V4 Flash and Pro entries", () => {
     assert.deepEqual(model.input_modalities, ["text", "image"]);
     assert.equal(model.prefer_websockets, false);
   }
+});
+
+test("catalog readiness accepts a generated catalog with both DeepSeek models", () => {
+  assert.equal(isCatalogReady(buildCatalog({ models: [TEMPLATE] })), true);
+});
+
+test("catalog readiness rejects native-only and partially merged catalogs", () => {
+  const catalog = buildCatalog({ models: [TEMPLATE] });
+  const nativeOnly = {
+    models: catalog.models.filter((model) => !model.slug.startsWith("deepseek/")),
+  };
+  const missingPro = {
+    models: catalog.models.filter((model) => model.slug !== "deepseek/deepseek-v4-pro"),
+  };
+
+  assert.equal(isCatalogReady(nativeOnly), false);
+  assert.equal(isCatalogReady(missingPro), false);
+});
+
+test("catalog readiness rejects entries missing current required fields", () => {
+  for (const field of [
+    "slug",
+    "base_instructions",
+    "prefer_websockets",
+    "supports_reasoning_summaries",
+  ]) {
+    const catalog = buildCatalog({ models: [TEMPLATE] });
+    const native = catalog.models.find((model) => model.slug === TEMPLATE.slug);
+    delete native[field];
+    assert.equal(isCatalogReady(catalog), false, `missing ${field} should fail readiness`);
+  }
+});
+
+test("catalog readiness rejects malformed field types and duplicate slugs", () => {
+  const wrongType = buildCatalog({ models: [TEMPLATE] });
+  wrongType.models[0].prefer_websockets = "false";
+  assert.equal(isCatalogReady(wrongType), false);
+
+  const duplicate = buildCatalog({ models: [TEMPLATE] });
+  duplicate.models.push({ ...duplicate.models[0] });
+  assert.equal(isCatalogReady(duplicate), false);
+  assert.equal(isCatalogReady({ models: [] }), false);
+  assert.equal(isCatalogReady(null), false);
 });
 
 test("config injection is root-correct, reversible, and preserves user config", () => {

@@ -24,6 +24,17 @@ const NATIVE_ENTRY_DEFAULTS = {
   supports_reasoning_summaries: false,
 };
 
+// These fields are required by the current Codex model-catalog parser. Keep
+// this deliberately narrower than the full catalog shape: native entries may
+// gain optional fields independently, while doctor only needs to know that the
+// merged catalog is parseable and still contains both DSCodex models.
+const REQUIRED_ENTRY_FIELD_TYPES = Object.freeze({
+  slug: "string",
+  base_instructions: "string",
+  prefer_websockets: "boolean",
+  supports_reasoning_summaries: "boolean",
+});
+
 function backfillNativeEntry(model) {
   const entry = clone(model);
   for (const [key, value] of Object.entries(NATIVE_ENTRY_DEFAULTS)) {
@@ -111,6 +122,22 @@ export function buildCatalog(cache) {
       ...nativeModels.map(backfillNativeEntry),
     ],
   };
+}
+
+export function isCatalogReady(catalog) {
+  if (!Array.isArray(catalog?.models) || catalog.models.length === 0) return false;
+
+  const slugs = new Set();
+  for (const model of catalog.models) {
+    if (!model || typeof model !== "object" || Array.isArray(model)) return false;
+    if (Object.entries(REQUIRED_ENTRY_FIELD_TYPES).some(([field, type]) => (
+      typeof model[field] !== type
+    ))) return false;
+    if (model.slug.trim().length === 0 || slugs.has(model.slug)) return false;
+    slugs.add(model.slug);
+  }
+
+  return DEEPSEEK_MODELS.every((model) => slugs.has(model.pickerSlug));
 }
 
 export function writeCatalog({ catalogPath, catalog }) {
