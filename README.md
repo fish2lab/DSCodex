@@ -130,7 +130,7 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex 本地路由
 - **思考反复折叠。** DeepSeek 每轮工具调用结束发 `response.completed`，Codex 折叠→执行→展开下一轮思考。这是 API 行为。无工具的单轮只折叠一次。
 - **GPT 识图。** 借用请求自带的 OAuth 头，无需额外 key。无 OAuth 时图片原样透传。默认模型 `gpt-5.6-sol`，`DSCODEX_VISION_MODEL` 可换。
 - **Key 存储、代理解析、bridge 细节、平台差异。** 详见 `AGENTS.md`。
-- **Voice / Pets / 插件 / 技能 / MCP。** 均为客户端功能；Voice 由 GPT-Live 驱动，不会路由到 DeepSeek。
+- **Voice / Pets / 插件 / 技能 / MCP。** Pets、插件、技能、MCP 均为客户端功能；Voice 由 GPT-Live 驱动，不会路由到 DeepSeek，但语音通话创建请求（WebRTC）会由路由器转发到 chatgpt.com 的 `realtime/calls` 端点。
 - **DeepSeek → GPT 任务历史。** 同一任务从 DeepSeek 切回 GPT 时，历史中的明文 `reasoning_text` 目前可能导致 GPT 请求返回 400；见 [#17](https://github.com/fish2lab/DSCodex/issues/17)。切回 DeepSeek 或新建 GPT 任务可继续使用。
 
 ## 卸载

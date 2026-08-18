@@ -120,7 +120,14 @@ The non-negotiable details:
     and `doctor` passes trivially. Windows config lives under `%USERPROFILE%\\.codex`; `0600` file
     permissions do not apply on NTFS (DSCodex relies on the user account ACL). Autostart uses the
     platform-native scheduler on all three OSes (launchd / systemd / Task Scheduler + VBS).
-15. Non-routed client features: Voice, Pets, plugins, skills, and MCP are all client-side and
-    unaffected by the router. Voice is driven by GPT-Live and is never routed to DeepSeek.
-    The catalog declares `prefer_websockets = false` — the router answers probes with 426, Codex
-    falls back to HTTP/SSE, and `codex doctor` may show a warning but requests work fine.
+15. Client features: Pets, plugins, skills, and MCP are all client-side and unaffected by the
+    router. Voice is driven by GPT-Live and is never routed to DeepSeek, but its WebRTC call
+    creation does pass through the router: `POST /v1/live` multipart bodies (an `sdp` part and a
+    JSON `session` part) are re-encoded as the official JSON shape and forwarded to
+    `chatgpt.com`'s `/backend-api/codex/realtime/calls` endpoint with the AVAS query params
+    (`intent=quicksilver&architecture=avas`) and the `OpenAI-Alpha: quicksilver=v2` header,
+    mirroring the official client. Live requests forward the client's full header set (cookies,
+    integrity-state, DeviceCheck) because that endpoint sits behind stricter Cloudflare checks.
+    The catalog declares `prefer_websockets = false` — the router answers upgrade probes with
+    426, Codex falls back to HTTP/SSE, and `codex doctor` may show a warning but requests work
+    fine.

@@ -60,6 +60,7 @@ const DEFAULT_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 128 * 1024 * 1024;
 const SHUTDOWN_HEADER = "x-dscodex-shutdown-token";
 const SHUTDOWN_PATH = "/_dscodex/shutdown";
+const LIVE_PATH = "/v1/live";
 const COMPACTION_PREFIX = "dscodex-compaction-v1:";
 const COMPACTION_PROMPT = [
   "Create a compact handoff summary of the conversation above for the next model turn.",
@@ -415,6 +416,62 @@ function copyRequestHeaders(request, deepSeekKey) {
   return headers;
 }
 
+// The /backend-api/realtime/calls endpoint sits behind stricter Cloudflare
+// protection than /responses: it wants the desktop client's session cookies,
+// integrity-state and DeviceCheck headers, not just the OAuth allowlist.
+// Forward everything the client sent (minus hop-by-hop and the loopback Host).
+function copyLiveRequestHeaders(request) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (value === undefined) continue;
+    if (name === "host" || name === "content-length" || HOP_BY_HOP_HEADERS.has(name)) continue;
+    headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  return headers;
+}
+
+// The desktop client creates voice calls by POSTing a multipart body with an
+// `sdp` part and a JSON `session` part. The official backend only accepts the
+// JSON form ({ sdp, session }) at /backend-api/codex/realtime/calls, so parse
+// the multipart and re-encode it before forwarding.
+function buildLiveCallBody(raw, contentType) {
+  const match = /boundary=(?:"([^"]+)"|([^;,\s]+))/i.exec(contentType);
+  if (!match) {
+    const error = new Error("live call multipart is missing a boundary");
+    error.statusCode = 400;
+    throw error;
+  }
+  const boundary = Buffer.from(`--${match[1] ?? match[2]}`);
+  const parts = [];
+  let start = raw.indexOf(boundary);
+  while (start !== -1) {
+    const markerEnd = start + boundary.length;
+    // A trailing "--" marks the closing boundary; the loop ends with it.
+    if (raw[markerEnd] === 0x2d && raw[markerEnd + 1] === 0x2d) break;
+    let headerStart = markerEnd;
+    if (raw[headerStart] === 0x0d && raw[headerStart + 1] === 0x0a) headerStart += 2;
+    const headerEnd = raw.indexOf("\r\n\r\n", headerStart);
+    if (headerEnd === -1) break;
+    const bodyStart = headerEnd + 4;
+    const nextBoundary = raw.indexOf(boundary, bodyStart);
+    const bodyEnd = Math.max(bodyStart, (nextBoundary === -1 ? raw.length : nextBoundary) - 2);
+    const headerText = raw.subarray(headerStart, headerEnd).toString("utf8");
+    const nameMatch = /name="([^"]*)"/.exec(headerText);
+    if (nameMatch) parts.push({ name: nameMatch[1], body: raw.subarray(bodyStart, bodyEnd) });
+    start = nextBoundary;
+  }
+  const sdp = parts.find((part) => part.name === "sdp");
+  if (!sdp) {
+    const error = new Error("live call multipart is missing the sdp part");
+    error.statusCode = 400;
+    throw error;
+  }
+  const call = { sdp: sdp.body.toString("utf8") };
+  const session = parts.find((part) => part.name === "session");
+  if (session) call.session = JSON.parse(session.body.toString("utf8"));
+  return Buffer.from(JSON.stringify(call));
+}
+
 function copyResponseHeaders(upstream, response) {
   for (const [name, value] of upstream.headers) {
     if (!HOP_BY_HOP_HEADERS.has(name)) response.setHeader(name, value);
@@ -497,43 +554,82 @@ export function createProxyServer({
     let direction = "unknown";
     try {
       const raw = await readRequestBody(request, maxRequestBytes);
-      let decoded;
-      try {
-        decoded = decodeBody(raw, request.headers["content-encoding"], maxDecodedBytes);
-      } catch (error) {
-        if (error?.code === "ERR_BUFFER_TOO_LARGE") error.statusCode = 413;
-        throw error;
-      }
-      if (decoded.length > maxDecodedBytes) {
-        const error = new Error("Decoded request body exceeds the configured limit");
-        error.statusCode = 413;
-        throw error;
-      }
-      const parsed = JSON.parse(decoded.toString("utf8"));
-      const deepSeekModel = deepSeekModelFor(parsed.model);
-      const deepSeek = Boolean(deepSeekModel);
-      const compactionRequest = deepSeek && isCompactionRequest(parsed);
-      direction = compactionRequest ? "deepseek-compaction" : deepSeek ? "deepseek" : "chatgpt";
-      if (deepSeek && !deepSeekKey) {
-        json(response, 503, { error: { message: "DEEPSEEK_API_KEY is not configured in the DSCodex server process" } });
-        return;
-      }
+      let deepSeek = false;
+      let deepSeekModel = null;
+      let compactionRequest = false;
       let outgoingBody = raw;
-      if (deepSeek) {
-        const body = compactionRequest
-          ? buildDeepSeekCompactionBody(parsed, routerToken)
-          : buildDeepSeekBody(parsed, { compactionSecret: routerToken });
-        // DeepSeek V4 is text-only: borrow the caller's GPT OAuth to describe any
-        // attached images, then inject the descriptions as plain input_text.
-        const rewritten = await vision.rewriteImages(body, request.headers);
-        if (rewritten) logger.info?.(`vision: described ${rewritten} image(s) for ${pathname}`);
-        outgoingBody = Buffer.from(JSON.stringify(body));
+      let liveCallJson = false;
+      if (pathname === LIVE_PATH) {
+        // Voice/Realtime calls arrive as multipart (sdp + session); the official
+        // backend only accepts the JSON form, so convert it before forwarding.
+        // Non-multipart bodies (e.g. probes) are passed through unchanged.
+        direction = "chatgpt-live";
+        const contentType = request.headers["content-type"] ?? "";
+        if (contentType.toLowerCase().startsWith("multipart/form-data")) {
+          outgoingBody = buildLiveCallBody(raw, contentType);
+          liveCallJson = true;
+        }
+      } else {
+        let decoded;
+        try {
+          decoded = decodeBody(raw, request.headers["content-encoding"], maxDecodedBytes);
+        } catch (error) {
+          if (error?.code === "ERR_BUFFER_TOO_LARGE") error.statusCode = 413;
+          throw error;
+        }
+        if (decoded.length > maxDecodedBytes) {
+          const error = new Error("Decoded request body exceeds the configured limit");
+          error.statusCode = 413;
+          throw error;
+        }
+        const parsed = JSON.parse(decoded.toString("utf8"));
+        deepSeekModel = deepSeekModelFor(parsed.model);
+        deepSeek = Boolean(deepSeekModel);
+        compactionRequest = deepSeek && isCompactionRequest(parsed);
+        direction = compactionRequest ? "deepseek-compaction" : deepSeek ? "deepseek" : "chatgpt";
+        if (deepSeek && !deepSeekKey) {
+          json(response, 503, { error: { message: "DEEPSEEK_API_KEY is not configured in the DSCodex server process" } });
+          return;
+        }
+        if (deepSeek) {
+          const body = compactionRequest
+            ? buildDeepSeekCompactionBody(parsed, routerToken)
+            : buildDeepSeekBody(parsed, { compactionSecret: routerToken });
+          // DeepSeek V4 is text-only: borrow the caller's GPT OAuth to describe any
+          // attached images, then inject the descriptions as plain input_text.
+          const rewritten = await vision.rewriteImages(body, request.headers);
+          if (rewritten) logger.info?.(`vision: described ${rewritten} image(s) for ${pathname}`);
+          outgoingBody = Buffer.from(JSON.stringify(body));
+        }
       }
       const baseUrl = deepSeek ? deepSeekBaseUrl : chatGptBaseUrl;
-      const target = new URL(`${baseUrl.replace(/\/$/, "")}${upstreamPath(pathname)}${url.search}`);
-      const headers = copyRequestHeaders(request, deepSeek ? deepSeekKey : undefined);
+      const isLiveCall = pathname === LIVE_PATH;
+      // The desktop app's voice mode creates WebRTC calls on the official
+      // realtime/calls route; no other candidate is valid. The official
+      // client marks these calls with the AVAS query params, and the
+      // backend gate reads the same values from the OpenAI-Alpha header.
+      const liveCallBase = baseUrl.replace(/\/codex\/?$/, "").replace(/\/$/, "");
+      const target = new URL(
+        `${isLiveCall ? `${liveCallBase}/codex/realtime/calls` : `${baseUrl.replace(/\/$/, "")}${upstreamPath(pathname)}`}${url.search}`,
+      );
+      if (isLiveCall) {
+        target.searchParams.set("intent", "quicksilver");
+        target.searchParams.set("architecture", "avas");
+      }
+      const headers = isLiveCall
+        ? copyLiveRequestHeaders(request)
+        : copyRequestHeaders(request, deepSeek ? deepSeekKey : undefined);
+      if (isLiveCall) {
+        // The desktop client does not send this header through the router;
+        // the backend gate requires it to name the quicksilver protocol
+        // version; the AVAS call architecture requires v2.
+        headers.set("openai-alpha", "quicksilver=v2");
+      }
       if (!deepSeek && request.headers["content-encoding"]) {
         headers.set("content-encoding", request.headers["content-encoding"]);
+      }
+      if (isLiveCall && request.headers["content-type"]) {
+        headers.set("content-type", liveCallJson ? "application/json" : request.headers["content-type"]);
       }
       headers.set("content-length", String(outgoingBody.length));
 
@@ -543,6 +639,9 @@ export function createProxyServer({
       response.on("close", () => {
         if (!response.writableFinished) controller.abort();
       });
+      if (isLiveCall) {
+        logger.info?.(`live ${pathname} -> ${target.host}${target.pathname}`);
+      }
       const upstream = await fetch(target, {
         method: "POST",
         headers,

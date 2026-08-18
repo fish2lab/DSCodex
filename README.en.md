@@ -129,7 +129,7 @@ Yes. Tool calls and web search use DeepSeek's Responses API. Because the text-on
 - **Why reasoning folds mid-task.** DeepSeek emits `response.completed` after every tool round; Codex folds the reasoning block, runs the tool, and opens a new request. API behavior, not a bug. No-tool turns fold once at the end.
 - **GPT vision.** Borrows the request's ChatGPT OAuth headers (no extra key). Without OAuth headers images pass through untouched. Default model `gpt-5.6-sol`, override with `DSCODEX_VISION_MODEL`.
 - **Key storage, proxy resolution, bridge details, platform differences.** See `AGENTS.md`.
-- **Voice / Pets / plugins / skills / MCP.** All client-side; Voice runs on GPT-Live and is never routed to DeepSeek.
+- **Voice / Pets / plugins / skills / MCP.** Pets, plugins, skills, and MCP are all client-side; Voice runs on GPT-Live and is never routed to DeepSeek, but its WebRTC call creation is forwarded by the router to chatgpt.com's `realtime/calls` endpoint.
 - **DeepSeek → GPT thread history.** Switching an existing task from DeepSeek back to GPT can currently leave plaintext `reasoning_text` in history and cause a persistent GPT 400 response; see [#17](https://github.com/fish2lab/DSCodex/issues/17). Switching back to DeepSeek or starting a new GPT task remains available.
 
 ## Uninstall
