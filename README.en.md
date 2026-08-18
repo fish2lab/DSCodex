@@ -96,6 +96,8 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex loopback router
 
 Traffic is split by model name. Only DeepSeek-bound requests are rewritten; GPT traffic is forwarded transparently.
 
+The installer manages root-level `model_provider = "dscodex"` plus `[model_providers.dscodex]`, pinning ordinary model requests to OAuth-authenticated HTTP Responses (`wire_api = "responses"`, `requires_openai_auth = true`, `supports_websockets = false`). This lets the router inspect the requested model before choosing DeepSeek or ChatGPT. Otherwise Codex can place a `deepseek/...` model on ChatGPT's account-only Responses WebSocket and report that the model is unsupported with a ChatGPT account. Voice keeps its separate Realtime sideband WebSocket.
+
 ## Compatibility
 
 | Surface or behavior | Status |
@@ -123,13 +125,17 @@ Yes. Codex CLI and IDE extensions are supported on macOS, Linux, and Windows; na
 
 Yes. Tool calls and web search use DeepSeek's Responses API. Because the text-only models cannot see images directly, DSCodex first asks GPT for an image description. Automatic and manual compaction produce an encrypted Codex compaction item.
 
+### Why does Codex say DeepSeek is unsupported with a ChatGPT account?
+
+Codex is still treating DeepSeek as a WebSocket model on its built-in OpenAI provider. After updating DSCodex, rerun `node src/cli.mjs install` (and `node src/cli.mjs autostart enable` when autostart is used), then fully quit and relaunch ChatGPT / Codex. DSCodex adds its marker-owned HTTP-only provider configuration. It preserves other custom providers and refuses to replace a user-owned `model_provider` or `[model_providers.dscodex]` table.
+
 ## Known edge cases
 
 - **Usage stats.** The Codex app's Profile page is read-only — DeepSeek usage cannot be added.
 - **Why reasoning folds mid-task.** DeepSeek emits `response.completed` after every tool round; Codex folds the reasoning block, runs the tool, and opens a new request. API behavior, not a bug. No-tool turns fold once at the end.
 - **GPT vision.** Borrows the request's ChatGPT OAuth headers (no extra key). Without OAuth headers images pass through untouched. Default model `gpt-5.6-sol`, override with `DSCODEX_VISION_MODEL`.
 - **Key storage, proxy resolution, bridge details, platform differences.** See `AGENTS.md`.
-- **Voice / Pets / plugins / skills / MCP.** Pets, plugins, skills, and MCP are all client-side; Voice runs on GPT-Live and is never routed to DeepSeek, but its WebRTC call creation is forwarded by the router to chatgpt.com's `realtime/calls` endpoint.
+- **Voice / Pets / plugins / skills / MCP.** Pets, plugins, skills, and MCP are all client-side. Voice runs on GPT-Live and is never routed to DeepSeek. Its WebRTC call creation is forwarded to chatgpt.com's `realtime/calls` endpoint, and its authenticated Realtime sideband WebSocket reaches the fixed OpenAI Realtime upstream through the configured proxy. Background Responses work uses the same routable HTTP/SSE path as ordinary model traffic. An authenticated ChatGPT Responses WebSocket relay remains only for older-client compatibility; DeepSeek never uses it.
 - **DeepSeek → GPT thread history.** Switching an existing task from DeepSeek back to GPT can currently leave plaintext `reasoning_text` in history and cause a persistent GPT 400 response; see [#17](https://github.com/fish2lab/DSCodex/issues/17). Switching back to DeepSeek or starting a new GPT task remains available.
 
 ## Uninstall
@@ -138,7 +144,7 @@ Yes. Tool calls and web search use DeepSeek's Responses API. Because the text-on
 node src/cli.mjs stop && node src/cli.mjs uninstall
 ```
 
-Removes only DSCodex-owned config and files. The pre-install backup stays at `~/.codex/config.toml.pre-dscodex.bak`.
+Removes only DSCodex-owned config and files. The pre-install backup stays at `~/.codex/config.toml.pre-dscodex.bak`. If fields or subtables were manually added to the marker-owned `[model_providers.dscodex]`, uninstall refuses before stopping the service or deleting state; restore the original table shape or handle those customizations manually first.
 
 ## References
 

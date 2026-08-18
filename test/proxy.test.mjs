@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { generateKeyPairSync, sign } from "node:crypto";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import test from "node:test";
 import { once } from "node:events";
@@ -28,6 +31,129 @@ async function bodyOf(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function readSocketUntil(socket, needle, timeoutMs = 1_000) {
+  return new Promise((resolve, reject) => {
+    let received = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for socket data: ${needle}`));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("end", onEnd);
+      socket.off("error", onError);
+    };
+    const onData = (chunk) => {
+      received += chunk.toString("utf8");
+      if (!received.includes(needle)) return;
+      cleanup();
+      resolve(received);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(received);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.on("data", onData);
+    socket.on("end", onEnd);
+    socket.on("error", onError);
+  });
+}
+
+function derLength(length) {
+  if (length < 128) return Buffer.from([length]);
+  const bytes = [];
+  for (let remaining = length; remaining > 0; remaining = Math.floor(remaining / 256)) {
+    bytes.unshift(remaining & 0xff);
+  }
+  return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+
+function derElement(tag, content) {
+  return Buffer.concat([Buffer.from([tag]), derLength(content.length), content]);
+}
+
+function derSequence(...parts) {
+  return derElement(0x30, Buffer.concat(parts));
+}
+
+function derInteger(value) {
+  let hex = value.toString(16);
+  if (hex.length % 2 === 1) hex = `0${hex}`;
+  const bytes = Buffer.from(hex, "hex");
+  const padded = bytes[0] & 0x80 ? Buffer.concat([Buffer.from([0]), bytes]) : bytes;
+  return derElement(0x02, padded);
+}
+
+function derOid(oid) {
+  const numbers = oid.split(".").map(Number);
+  const encoded = [40 * numbers[0] + numbers[1]];
+  for (const number of numbers.slice(2)) {
+    const base128 = [number % 128];
+    let remaining = Math.floor(number / 128);
+    while (remaining > 0) {
+      base128.unshift((remaining % 128) | 0x80);
+      remaining = Math.floor(remaining / 128);
+    }
+    encoded.push(...base128);
+  }
+  return derElement(0x06, Buffer.from(encoded));
+}
+
+function derNull() {
+  return Buffer.from([0x05, 0x00]);
+}
+
+function derBitString(contents) {
+  return derElement(0x03, Buffer.concat([Buffer.from([0]), contents]));
+}
+
+function derUtcTime(date) {
+  const stamp = `${date.toISOString().replace(/[-:T.Z]/g, "").slice(2, 14)}Z`;
+  return derElement(0x17, Buffer.from(stamp, "ascii"));
+}
+
+function derName(commonName) {
+  const cn = derSequence(derOid("2.5.4.3"), derElement(0x0c, Buffer.from(commonName, "utf8")));
+  return derSequence(derElement(0x31, cn));
+}
+
+function pemEncode(label, der) {
+  const wrapped = der.toString("base64").match(/.{1,64}/g).join("\n");
+  return `-----BEGIN ${label}-----\n${wrapped}\n-----END ${label}-----\n`;
+}
+
+// Builds a throwaway RSA keypair and a self-signed v3 certificate at test time
+// so no private-key material has to live in the repository.
+function ephemeralTlsPair() {
+  const { publicKey, privateKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "pkcs1", format: "der" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  const rsaAlgorithm = derSequence(derOid("1.2.840.113549.1.1.1"), derNull());
+  const signatureAlgorithm = derSequence(derOid("1.2.840.113549.1.1.11"), derNull());
+  const subject = derName("api.openai.test");
+  const now = new Date();
+  const notAfter = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  const tbsCertificate = derSequence(
+    derElement(0xa0, derInteger(2)),
+    derInteger(0x01),
+    signatureAlgorithm,
+    subject,
+    derSequence(derUtcTime(now), derUtcTime(notAfter)),
+    subject,
+    derSequence(rsaAlgorithm, derBitString(publicKey)),
+  );
+  const signature = sign("sha256", tbsCertificate, privateKey);
+  const certificate = derSequence(tbsCertificate, signatureAlgorithm, derBitString(signature));
+  return { key: privateKey, cert: pemEncode("CERTIFICATE", certificate) };
 }
 
 test("routes V4 Flash and Pro to their native DeepSeek Responses models", async (t) => {
@@ -644,6 +770,717 @@ test("never asks DeepSeek for parallel tool calls", () => {
     input: [say("user", "u1")],
   });
   assert.equal(body.parallel_tool_calls, false);
+});
+
+test("relays authenticated Responses WebSocket upgrades and bytes in both directions", async (t) => {
+  let observed;
+  let upstreamSocket;
+  let resolveClientPayload;
+  const clientPayload = new Promise((resolve) => { resolveClientPayload = resolve; });
+  const upstream = http.createServer();
+  upstream.on("upgrade", (request, socket, head) => {
+    upstreamSocket = socket;
+    observed = {
+      path: request.url,
+      authorization: request.headers.authorization,
+      account: request.headers["chatgpt-account-id"],
+      metadata: request.headers["x-codex-turn-metadata"],
+      protocol: request.headers["sec-websocket-protocol"],
+      host: request.headers.host,
+    };
+    socket.on("data", (chunk) => {
+      if (chunk.toString("utf8").includes("client-payload")) resolveClientPayload();
+    });
+    if (head.toString("utf8").includes("client-payload")) resolveClientPayload();
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+      + "Sec-WebSocket-Protocol: responses\r\n\r\n"
+      + "upstream-ready",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  const proxyUrl = await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    upstreamSocket?.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/responses?conversation=voice HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    + "Sec-WebSocket-Protocol: responses\r\n"
+    + "Authorization: Bearer oauth-token\r\n"
+    + "ChatGPT-Account-Id: acct-test\r\n"
+    + "X-Codex-Turn-Metadata: metadata-test\r\n\r\n",
+  );
+
+  const handshake = await readSocketUntil(clientSocket, "upstream-ready");
+  assert.match(handshake, /^HTTP\/1\.1 101 Switching Protocols/);
+  assert.match(handshake, /Sec-WebSocket-Protocol: responses/i);
+  assert.equal(observed.path, "/backend-api/codex/responses?conversation=voice");
+  assert.equal(observed.authorization, "Bearer oauth-token");
+  assert.equal(observed.account, "acct-test");
+  assert.equal(observed.metadata, "metadata-test");
+  assert.equal(observed.protocol, "responses");
+  assert.notEqual(observed.host, `127.0.0.1:${port}`);
+
+  clientSocket.write("client-payload");
+  await clientPayload;
+});
+
+test("relays authenticated Realtime sideband WebSockets through the dedicated upstream", async (t) => {
+  let observed;
+  let upstreamSocket;
+  let resolveClientPayload;
+  const clientPayload = new Promise((resolve) => { resolveClientPayload = resolve; });
+  const upstream = http.createServer();
+  upstream.on("upgrade", (request, socket, head) => {
+    upstreamSocket = socket;
+    observed = {
+      path: request.url,
+      authorization: request.headers.authorization,
+      account: request.headers["chatgpt-account-id"],
+      alpha: request.headers["openai-alpha"],
+      session: request.headers["x-session-id"],
+      scopedSession: request.headers["x-openai-scoped-session-id"],
+      thread: request.headers["x-openai-thread-id"],
+      attestation: request.headers["x-oai-attestation"],
+      host: request.headers.host,
+    };
+    socket.on("data", (chunk) => {
+      if (chunk.toString("utf8").includes("client-sideband-payload")) resolveClientPayload();
+    });
+    if (head.toString("utf8").includes("client-sideband-payload")) resolveClientPayload();
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+      + "sideband-ready",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const infoLogs = [];
+  const proxy = createProxyServer({
+    chatGptBaseUrl: "http://unused.example/backend-api/codex",
+    realtimeApiBaseUrl: `${upstreamUrl}/v1`,
+    logger: { info(message) { infoLogs.push(message); }, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    upstreamSocket?.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/live/rtc_voice-123?source=voice HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    + "Authorization: Bearer oauth-token\r\n"
+    + "ChatGPT-Account-Id: acct-test\r\n"
+    + "OpenAI-Alpha: quicksilver=v2\r\n"
+    + "X-Session-Id: realtime-session\r\n"
+    + "X-OpenAI-Scoped-Session-Id: codex-session\r\n"
+    + "X-OpenAI-Thread-Id: codex-thread\r\n"
+    + "X-OAI-Attestation: attestation-test\r\n\r\n",
+  );
+
+  const handshake = await readSocketUntil(clientSocket, "sideband-ready");
+  assert.match(handshake, /^HTTP\/1\.1 101 Switching Protocols/);
+  assert.equal(observed.path, "/v1/live/rtc_voice-123?source=voice");
+  assert.equal(observed.authorization, "Bearer oauth-token");
+  assert.equal(observed.account, "acct-test");
+  assert.equal(observed.alpha, "quicksilver=v2");
+  assert.equal(observed.session, "realtime-session");
+  assert.equal(observed.scopedSession, "codex-session");
+  assert.equal(observed.thread, "codex-thread");
+  assert.equal(observed.attestation, "attestation-test");
+  assert.notEqual(observed.host, `127.0.0.1:${port}`);
+  assert.equal(infoLogs.join("\n").includes("rtc_voice-123"), false);
+
+  clientSocket.write("client-sideband-payload");
+  await clientPayload;
+});
+
+test("routes HTTPS Realtime sideband WebSockets through the configured CONNECT proxy", { timeout: 10_000 }, async (t) => {
+  const { key, cert } = ephemeralTlsPair();
+  let upstreamSocket;
+  let observed;
+  const upstream = https.createServer({ key, cert });
+  upstream.on("upgrade", (request, socket) => {
+    upstreamSocket = socket;
+    observed = {
+      path: request.url,
+      authorization: request.headers.authorization,
+    };
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+      + "connect-proxy-ready",
+    );
+  });
+  await listen(upstream);
+  const upstreamPort = upstream.address().port;
+
+  const tunnelSockets = new Set();
+  const connectTargets = [];
+  const connectProxy = http.createServer((_request, response) => {
+    response.writeHead(405);
+    response.end();
+  });
+  connectProxy.on("connect", (request, clientSocket, head) => {
+    connectTargets.push(request.url);
+    const targetSocket = net.connect(upstreamPort, "127.0.0.1", () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) targetSocket.write(head);
+      clientSocket.pipe(targetSocket);
+      targetSocket.pipe(clientSocket);
+    });
+    tunnelSockets.add(clientSocket);
+    tunnelSockets.add(targetSocket);
+    clientSocket.on("error", () => {});
+    targetSocket.on("error", () => clientSocket.destroy());
+    clientSocket.once("close", () => tunnelSockets.delete(clientSocket));
+    targetSocket.once("close", () => tunnelSockets.delete(targetSocket));
+  });
+  const connectProxyUrl = await listen(connectProxy);
+
+  const proxyModuleUrl = new URL("../src/proxy.mjs", import.meta.url).href;
+  const childSource = `
+    import { once } from "node:events";
+    const { createProxyServer } = await import(${JSON.stringify(proxyModuleUrl)});
+    const server = createProxyServer({
+      realtimeApiBaseUrl: process.env.TEST_REALTIME_BASE_URL,
+      logger: { info() {}, error() {} },
+      routerToken: ${JSON.stringify(ROUTER_TOKEN)},
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    console.log(server.address().port);
+    process.on("SIGTERM", () => {
+      server.closeUpgradeConnections?.();
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1_000).unref();
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", childSource], {
+    env: {
+      ...process.env,
+      NODE_OPTIONS: "--use-env-proxy",
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+      HTTPS_PROXY: connectProxyUrl,
+      https_proxy: connectProxyUrl,
+      HTTP_PROXY: connectProxyUrl,
+      http_proxy: connectProxyUrl,
+      NO_PROXY: "",
+      no_proxy: "",
+      ALL_PROXY: "",
+      all_proxy: "",
+      TEST_REALTIME_BASE_URL: `https://api.openai.test:${upstreamPort}/v1`,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let childStderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { childStderr += chunk; });
+  const routerPort = await new Promise((resolve, reject) => {
+    let stdout = "";
+    const timer = setTimeout(() => reject(new Error(`timed out starting proxy child: ${childStderr}`)), 3_000);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      const line = stdout.split("\n")[0].trim();
+      if (!/^\d+$/.test(line)) return;
+      clearTimeout(timer);
+      resolve(Number(line));
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`proxy child exited ${code}: ${childStderr}`));
+    });
+  });
+
+  const clientSocket = net.connect(routerPort, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    upstreamSocket?.destroy();
+    for (const socket of tunnelSockets) socket.destroy();
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      await once(child, "exit");
+    }
+    await close(connectProxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/live/rtc_connect-123 HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${routerPort}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    + "Authorization: Bearer oauth-through-connect\r\n\r\n",
+  );
+
+  const handshake = await readSocketUntil(clientSocket, "connect-proxy-ready", 3_000);
+  assert.match(handshake, /^HTTP\/1\.1 101 Switching Protocols/);
+  assert.deepEqual(connectTargets, [`api.openai.test:${upstreamPort}`]);
+  assert.equal(observed.path, "/v1/live/rtc_connect-123");
+  assert.equal(observed.authorization, "Bearer oauth-through-connect");
+});
+
+test("relays legacy Realtime sideband call_id upgrades to the Realtime endpoint", async (t) => {
+  let observedPath;
+  let upstreamSocket;
+  const upstream = http.createServer();
+  upstream.on("upgrade", (request, socket) => {
+    upstreamSocket = socket;
+    observedPath = request.url;
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const infoLogs = [];
+  const proxy = createProxyServer({
+    realtimeApiBaseUrl: `${upstreamUrl}/v1`,
+    logger: { info(message) { infoLogs.push(message); }, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    upstreamSocket?.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/realtime?intent=quicksilver&call_id=rtc_voice-legacy HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    + "Authorization: Bearer oauth-token\r\n"
+    + "OpenAI-Alpha: quicksilver=v2\r\n\r\n",
+  );
+
+  const handshake = await readSocketUntil(clientSocket, "\r\n\r\n");
+  assert.match(handshake, /^HTTP\/1\.1 101 Switching Protocols/);
+  assert.equal(observedPath, "/v1/realtime?intent=quicksilver&call_id=rtc_voice-legacy");
+  assert.equal(infoLogs.join("\n").includes("rtc_voice-legacy"), false);
+});
+
+test("rejects invalid or duplicate Realtime call IDs without leaking them to logs", async (t) => {
+  let upstreamHits = 0;
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamHits += 1;
+    socket.destroy();
+  });
+  const upstreamUrl = await listen(upstream);
+  const infoLogs = [];
+  const proxy = createProxyServer({
+    realtimeApiBaseUrl: `${upstreamUrl}/v1`,
+    logger: { info(message) { infoLogs.push(message); }, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const sockets = new Set();
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+
+  const requestUpgrade = async (path) => {
+    const socket = net.connect(port, "127.0.0.1");
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    await once(socket, "connect");
+    socket.write(
+      `GET /${ROUTER_TOKEN}${path} HTTP/1.1\r\n`
+      + `Host: 127.0.0.1:${port}\r\n`
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Version: 13\r\n"
+      + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    );
+    return readSocketUntil(socket, "\r\n\r\n");
+  };
+
+  const invalidCallId = "rtc.secret.invalid";
+  const invalid = await requestUpgrade(`/v1/live/${invalidCallId}`);
+  const duplicate = await requestUpgrade("/v1/realtime?call_id=first-secret&call_id=second-secret");
+  assert.match(invalid, /^HTTP\/1\.1 426 Upgrade Required/);
+  assert.match(duplicate, /^HTTP\/1\.1 426 Upgrade Required/);
+  assert.equal(upstreamHits, 0);
+  const logs = infoLogs.join("\n");
+  assert.equal(logs.includes(invalidCallId), false);
+  assert.equal(logs.includes("first-secret"), false);
+  assert.equal(logs.includes("second-secret"), false);
+});
+
+test("rejects an unauthenticated Responses WebSocket before contacting upstream", async (t) => {
+  let upstreamHits = 0;
+  const infoLogs = [];
+  const invalidToken = "B".repeat(43);
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamHits += 1;
+    socket.destroy();
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info(message) { infoLogs.push(message); }, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${invalidToken}/v1/responses HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+  );
+
+  const response = await readSocketUntil(clientSocket, "\r\n\r\n");
+  assert.match(response, /^HTTP\/1\.1 404 Not Found/);
+  assert.equal(upstreamHits, 0);
+  assert.equal(infoLogs.join("\n").includes(invalidToken), false);
+});
+
+test("keeps authenticated non-Responses upgrades on the HTTP fallback path", async (t) => {
+  let upstreamHits = 0;
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamHits += 1;
+    socket.destroy();
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/models HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n\r\n",
+  );
+
+  const response = await readSocketUntil(clientSocket, "\r\n\r\n");
+  assert.match(response, /^HTTP\/1\.1 426 Upgrade Required/);
+  assert.equal(upstreamHits, 0);
+});
+
+test("returns 502 when the Responses WebSocket upstream is unavailable", async (t) => {
+  const unavailable = http.createServer();
+  const unavailableUrl = await listen(unavailable);
+  await close(unavailable);
+  const errorLogs = [];
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${unavailableUrl}/backend-api/codex`,
+    logger: { info() {}, error(message) { errorLogs.push(message); } },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    await close(proxy);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/responses HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+  );
+
+  const response = await readSocketUntil(clientSocket, "\r\n\r\n");
+  assert.match(response, /^HTTP\/1\.1 502 Bad Gateway/);
+  assert.match(errorLogs.join("\n"), /websocket proxy error \(\/v1\/responses\)/);
+});
+
+test("relays an upstream WebSocket rejection to the Codex client", async (t) => {
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    socket.end(
+      "HTTP/1.1 401 Unauthorized\r\n"
+      + "Connection: close\r\n"
+      + "WWW-Authenticate: Bearer\r\n"
+      + "Content-Length: 0\r\n\r\n",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/responses HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+  );
+
+  const response = await readSocketUntil(clientSocket, "\r\n\r\n");
+  assert.match(response, /^HTTP\/1\.1 401 Unauthorized/);
+  assert.match(response, /WWW-Authenticate: Bearer/i);
+});
+
+test("reframes chunked WebSocket rejection bodies for a real HTTP client", async (t) => {
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    socket.end(
+      "HTTP/1.1 401 Unauthorized\r\n"
+      + "Connection: close\r\n"
+      + "Content-Type: text/plain\r\n"
+      + "Transfer-Encoding: chunked\r\n\r\n"
+      + "5\r\nhello\r\n0\r\n\r\n",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  t.after(async () => {
+    await close(proxy);
+    await close(upstream);
+  });
+
+  const result = await new Promise((resolve, reject) => {
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port,
+      path: `/${ROUTER_TOKEN}/v1/responses`,
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("error", reject);
+      response.on("end", () => resolve({
+        statusCode: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.on("upgrade", () => reject(new Error("unexpected WebSocket upgrade")));
+    request.on("error", reject);
+    request.setTimeout(1_000, () => request.destroy(new Error("timed out reading rejection body")));
+    request.end();
+  });
+
+  assert.equal(result.statusCode, 401);
+  assert.equal(result.headers["transfer-encoding"], undefined);
+  assert.equal(result.headers.connection, "close");
+  assert.equal(result.body, "hello");
+});
+
+test("closes the client when a WebSocket rejection body is truncated upstream", async (t) => {
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    socket.write(
+      "HTTP/1.1 502 Bad Gateway\r\n"
+      + "Connection: close\r\n"
+      + "Content-Type: text/plain\r\n"
+      + "Content-Length: 10\r\n\r\n"
+      + "hello",
+    );
+    setImmediate(() => socket.destroy());
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    proxy.closeUpgradeConnections();
+    await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  const clientClosed = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("client stayed open after the upstream rejection was truncated")), 500);
+    clientSocket.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/responses HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+  );
+
+  const response = await readSocketUntil(clientSocket, "hello");
+  assert.match(response, /^HTTP\/1\.1 502 Bad Gateway/);
+  await clientClosed;
+});
+
+for (const kind of ["HTTP", "upgrade"]) {
+  test(`rejects malformed absolute-form ${kind} targets without stopping the router`, async (t) => {
+    const proxy = createProxyServer({
+      logger: { info() {}, error() {} },
+      routerToken: ROUTER_TOKEN,
+    });
+    const proxyUrl = await listen(proxy);
+    const { port } = proxy.address();
+    const clientSocket = net.connect(port, "127.0.0.1");
+    t.after(async () => {
+      clientSocket.destroy();
+      await close(proxy);
+    });
+    await once(clientSocket, "connect");
+    clientSocket.write(
+      "GET http://[ HTTP/1.1\r\n"
+      + `Host: 127.0.0.1:${port}\r\n`
+      + (kind === "upgrade" ? "Connection: Upgrade\r\nUpgrade: websocket\r\n" : "Connection: close\r\n")
+      + "\r\n",
+    );
+
+    const response = await readSocketUntil(clientSocket, "\r\n\r\n");
+    assert.match(response, /^HTTP\/1\.1 400 Bad Request/);
+    const health = await fetch(route(proxyUrl, "/health"));
+    assert.equal(health.status, 200);
+  });
+}
+
+test("force-closes upgraded sockets so router shutdown can finish", async (t) => {
+  let upstreamSocket;
+  const upstream = http.createServer();
+  upstream.on("upgrade", (_request, socket) => {
+    upstreamSocket = socket;
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+    );
+  });
+  const upstreamUrl = await listen(upstream);
+  const proxy = createProxyServer({
+    chatGptBaseUrl: `${upstreamUrl}/backend-api/codex`,
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+  });
+  await listen(proxy);
+  const { port } = proxy.address();
+  const clientSocket = net.connect(port, "127.0.0.1");
+  t.after(async () => {
+    clientSocket.destroy();
+    upstreamSocket?.destroy();
+    if (proxy.listening) await close(proxy);
+    await close(upstream);
+  });
+  await once(clientSocket, "connect");
+  clientSocket.write(
+    `GET /${ROUTER_TOKEN}/v1/responses HTTP/1.1\r\n`
+    + `Host: 127.0.0.1:${port}\r\n`
+    + "Connection: Upgrade\r\n"
+    + "Upgrade: websocket\r\n"
+    + "Sec-WebSocket-Version: 13\r\n"
+    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+  );
+  await readSocketUntil(clientSocket, "\r\n\r\n");
+
+  const clientClosed = once(clientSocket, "close");
+  const serverClosed = new Promise((resolve, reject) => {
+    proxy.close((error) => error ? reject(error) : resolve());
+  });
+  proxy.closeUpgradeConnections();
+  await Promise.all([clientClosed, serverClosed]);
 });
 
 // Regression: the `upgrade` handler used to leave its detached socket without an

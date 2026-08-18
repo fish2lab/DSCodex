@@ -97,6 +97,8 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex 本地路由
 
 按模型名分流。路由仅改写 DeepSeek-bound 请求，GPT 流量透明旁路。
 
+安装器会管理根级 `model_provider = "dscodex"` 与 `[model_providers.dscodex]`，将普通模型请求固定为带 ChatGPT OAuth 的 HTTP Responses（`wire_api = "responses"`、`requires_openai_auth = true`、`supports_websockets = false`）。这样路由器能先读取请求中的模型名再决定去 DeepSeek 或 ChatGPT；否则 Codex 可能把 `deepseek/...` 直接放进 ChatGPT 账户专用的 Responses WebSocket，并返回 “model is not supported when using Codex with a ChatGPT account”。Voice 仍使用独立的 Realtime sideband WebSocket。
+
 ## 兼容性
 
 | 场景 | 状态 |
@@ -124,13 +126,17 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex 本地路由
 
 能。工具调用和 web search 走 DeepSeek Responses API；文字模型无法直接看到图片，因此 DSCodex 先用 GPT 生成图片描述；自动或手动压缩由 DSCodex 生成加密的 Codex compaction item。
 
+### 为什么提示 DeepSeek 不支持 ChatGPT account？
+
+这表示当前 Codex 仍把 DeepSeek 当成内置 OpenAI provider 的 WebSocket 模型。更新 DSCodex 后重新运行 `node src/cli.mjs install`（如使用自启，再运行 `node src/cli.mjs autostart enable`），然后完全退出并重开 ChatGPT / Codex。DSCodex 会补齐 marker-owned 的 HTTP-only provider 配置；不会覆盖用户的其他自定义 provider，若 `model_provider` 或 `[model_providers.dscodex]` 已由用户配置则会拒绝并提示冲突。
+
 ## 已知边界
 
 - **用量统计。** Codex 的 Profile 页面只读，无法计入 DeepSeek 用量。
 - **思考反复折叠。** DeepSeek 每轮工具调用结束发 `response.completed`，Codex 折叠→执行→展开下一轮思考。这是 API 行为。无工具的单轮只折叠一次。
 - **GPT 识图。** 借用请求自带的 OAuth 头，无需额外 key。无 OAuth 时图片原样透传。默认模型 `gpt-5.6-sol`，`DSCODEX_VISION_MODEL` 可换。
 - **Key 存储、代理解析、bridge 细节、平台差异。** 详见 `AGENTS.md`。
-- **Voice / Pets / 插件 / 技能 / MCP。** Pets、插件、技能、MCP 均为客户端功能；Voice 由 GPT-Live 驱动，不会路由到 DeepSeek，但语音通话创建请求（WebRTC）会由路由器转发到 chatgpt.com 的 `realtime/calls` 端点。
+- **Voice / Pets / 插件 / 技能 / MCP。** Pets、插件、技能、MCP 均为客户端功能；Voice 由 GPT-Live 驱动，不会路由到 DeepSeek。语音通话创建请求（WebRTC）会由路由器转发到 chatgpt.com 的 `realtime/calls` 端点。DSCodex 还会管理 `experimental_realtime_ws_base_url`，让 V3 的 `/v1/live/<call_id>` 侧带 WebSocket（并兼容旧版 `/v1/realtime?call_id=...`）通过已保存的出站代理连接固定的 OpenAI Realtime 上游；Voice 发起的后台 Responses 任务则和普通模型请求一样走可按模型分流的 HTTP/SSE。路由器仅为旧客户端保留经过认证的 ChatGPT Responses WebSocket 兼容通道，DeepSeek 不走该通道。
 - **DeepSeek → GPT 任务历史。** 同一任务从 DeepSeek 切回 GPT 时，历史中的明文 `reasoning_text` 目前可能导致 GPT 请求返回 400；见 [#17](https://github.com/fish2lab/DSCodex/issues/17)。切回 DeepSeek 或新建 GPT 任务可继续使用。
 
 ## 卸载
@@ -139,7 +145,7 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex 本地路由
 node src/cli.mjs stop && node src/cli.mjs uninstall
 ```
 
-只删除 DSCodex 写入的配置和文件。备份保留在 `~/.codex/config.toml.pre-dscodex.bak`。
+只删除 DSCodex 写入的配置和文件。备份保留在 `~/.codex/config.toml.pre-dscodex.bak`。如果手动给 marker-owned 的 `[model_providers.dscodex]` 增加了字段或子表，卸载会在停服务或删除状态前拒绝；先恢复该表的原始结构，或自行处理这些定制项。
 
 ## 参考
 

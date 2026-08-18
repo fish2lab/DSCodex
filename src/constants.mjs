@@ -20,6 +20,7 @@ export const DEEPSEEK_MODELS = Object.freeze([
 ]);
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 export const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+export const OPENAI_REALTIME_BASE_URL = "https://api.openai.com/v1";
 export const MANAGED_MARKER = "# DSCodex managed; remove with `dscodex uninstall`";
 
 export function deepSeekModelFor(model) {
