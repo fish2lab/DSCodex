@@ -34,9 +34,17 @@ The non-negotiable details:
    `codex -m deepseek/deepseek-v4-flash -c 'model_reasoning_effort="max"' -a never exec
    --skip-git-repo-check 'call a shell tool exactly once …'` and the same command with
    `deepseek/deepseek-v4-pro`.
-6. Do not edit `~/.codex/config.toml` by hand unless the user asks; the CLI owns its two
-   marker-owned root keys. GUI-written `model` / `model_reasoning_effort` lines are user-owned and
-   must be preserved.
+6. Do not edit `~/.codex/config.toml` by hand unless the user asks. The CLI owns exactly four
+   marker-owned root keys (`openai_base_url`, `experimental_realtime_ws_base_url`, `model_provider`,
+   and `model_catalog_json`) plus the exact marker-owned `[model_providers.dscodex]` table. It must
+   migrate both older root-block shapes, update the provider URL when the router token or port
+   changes, and preserve every unrelated root key and custom provider. Refuse before persisting a
+   token if the user already owns `model_provider` or `[model_providers.dscodex]`; uninstall removes
+   only exact DSCodex-owned blocks. Ownership checks must understand TOML-equivalent quoted and
+   dotted keys/tables without mistaking text inside multiline strings for config. If a user adds
+   fields or nested tables to the marker-owned provider, uninstall must refuse before stopping the
+   service or deleting any backing state. GUI-written `model` / `model_reasoning_effort` lines are
+   user-owned and must be preserved.
 7. Provider selection memory lives in `~/.codex/dscodex/model-selections.json`. OpenAI and
    DeepSeek have separate reasoning-effort slots; only OpenAI owns the saved service tier. The
    file also persists per-thread provider memory (bounded, last 500 threads) so resumed threads
@@ -77,13 +85,18 @@ The non-negotiable details:
     `NO_PROXY` always includes loopback plus `api.deepseek.com`). Proxy credentials are redacted
     in CLI output and DPAPI-protected on Windows; the proxy URL must never be confused with the
     DeepSeek key, which stays DPAPI/0600-protected and is never printed or committed.
-11. `install` generates a 256-bit router token and writes it into the managed `openai_base_url`;
-    `start` / `serve` must reconcile that marker-owned URL with the persisted token and selected
-    port, and `doctor` must verify the exact binding. The proxy must reject requests without that
-    path token. `serve` owns a 0600 pid-state file with a per-instance shutdown token. `stop` may
-    only use the authenticated shutdown endpoint and must atomically preserve replacement-instance
-    state; it must never terminate an unverified or recycled PID. Cap both compressed request bytes
-    and decompressed request bytes before parsing JSON.
+11. `install` generates a 256-bit router token and writes it into the managed `openai_base_url` and
+    `[model_providers.dscodex].base_url`. The root `model_provider` selects `dscodex`; its provider
+    table must declare `wire_api = "responses"`, `requires_openai_auth = true`, and
+    `supports_websockets = false`. HTTP-only normal model traffic is required so the router can
+    inspect the model before choosing DeepSeek or ChatGPT; sending `deepseek/...` through the
+    built-in OpenAI provider's Responses WebSocket makes ChatGPT reject it as unsupported for the
+    account. `start` / `serve` must reconcile both marker-owned URLs with the persisted token and
+    selected port, and `doctor` must verify the exact binding. The proxy must reject requests
+    without that path token. `serve` owns a 0600 pid-state file with a per-instance shutdown token.
+    `stop` may only use the authenticated shutdown endpoint and must atomically preserve
+    replacement-instance state; it must never terminate an unverified or recycled PID. Cap both
+    compressed request bytes and decompressed request bytes before parsing JSON.
 12. DeepSeek does not implement Codex remote compaction v2. For a DeepSeek-bound request containing
     `compaction_trigger`, the router must remove tools and the trigger, ask the same DeepSeek model
     for a compact handoff summary, and return exactly one synthetic `compaction` output item before
@@ -120,7 +133,23 @@ The non-negotiable details:
     and `doctor` passes trivially. Windows config lives under `%USERPROFILE%\\.codex`; `0600` file
     permissions do not apply on NTFS (DSCodex relies on the user account ACL). Autostart uses the
     platform-native scheduler on all three OSes (launchd / systemd / Task Scheduler + VBS).
-15. Non-routed client features: Voice, Pets, plugins, skills, and MCP are all client-side and
-    unaffected by the router. Voice is driven by GPT-Live and is never routed to DeepSeek.
-    The catalog declares `prefer_websockets = false` — the router answers probes with 426, Codex
-    falls back to HTTP/SSE, and `codex doctor` may show a warning but requests work fine.
+15. Client features: Pets, plugins, skills, and MCP are all client-side and unaffected by the
+    router. Voice is driven by GPT-Live and is never routed to DeepSeek, but its WebRTC call
+    creation does pass through the router: `POST /v1/live` multipart bodies (an `sdp` part and a
+    JSON `session` part) are re-encoded as the official JSON shape and forwarded to
+    `chatgpt.com`'s `/backend-api/codex/realtime/calls` endpoint with the AVAS query params
+    (`intent=quicksilver&architecture=avas`) and the `OpenAI-Alpha: quicksilver=v2` header,
+    mirroring the official client. Live requests forward the client's full header set (cookies,
+    integrity-state, DeviceCheck) because that endpoint sits behind stricter Cloudflare checks.
+    DSCodex owns the root `experimental_realtime_ws_base_url` setting and points it at the
+    authenticated loopback router's `/v1/realtime` base. Current Codex normalizes that base to
+    `/v1/live/<call_id>` for V3 sideband sessions; the router also supports legacy
+    `/v1/realtime?call_id=...`. Both routes validate the call ID, preserve required
+    authorization/session/attestation headers, redact call IDs from logs, and connect only to the
+    fixed `api.openai.com/v1` Realtime upstream through the saved outbound proxy. The catalog
+    declares `prefer_websockets = false`, while the managed `dscodex` provider declares
+    `supports_websockets = false`, so normal model traffic (including Voice background Responses
+    work) is always inspectable HTTP/SSE. The router retains authenticated `/v1/responses`
+    WebSocket tunneling to ChatGPT only for older-client compatibility. Other upgrade probes
+    receive 426 so Codex falls back to HTTP/SSE; DeepSeek traffic must never use the WebSocket
+    tunnel.

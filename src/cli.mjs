@@ -18,6 +18,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { buildCatalog, syncCatalog } from "./catalog.mjs";
 import {
+  assertSafeToUninstall,
   ensureManagedRouterBinding,
   install,
   managedRouterConfigMatches,
@@ -491,7 +492,10 @@ async function serve(port) {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    const forceTimer = setTimeout(() => server.closeAllConnections?.(), 5_000);
+    const forceTimer = setTimeout(() => {
+      server.closeUpgradeConnections?.();
+      server.closeAllConnections?.();
+    }, 5_000);
     server.close(() => {
       clearTimeout(forceTimer);
       removePidState(paths, { pid: process.pid, instanceId });
@@ -1046,6 +1050,9 @@ async function main() {
     case "doctor": await doctor(port); break;
     case "stop": await stop(); break;
     case "uninstall":
+      // Validate marker ownership before stopping services or deleting any
+      // generated state; a customized provider must make uninstall a no-op.
+      assertSafeToUninstall({ paths });
       await autostartDisable(paths, { quiet: true });
       await stop();
       uninstall({ paths });

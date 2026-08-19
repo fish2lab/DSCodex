@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import {
   createCipheriv,
   createDecipheriv,
@@ -11,6 +12,7 @@ import { Readable } from "node:stream";
 import {
   CHATGPT_CODEX_BASE_URL,
   DEEPSEEK_BASE_URL,
+  OPENAI_REALTIME_BASE_URL,
   deepSeekModelFor,
 } from "./constants.mjs";
 import { createVisionDescriber } from "./vision.mjs";
@@ -19,6 +21,7 @@ const CHATGPT_FORWARDED_REQUEST_HEADERS = new Set([
   "authorization",
   "chatgpt-account-id",
   "openai-beta",
+  "openai-alpha",
   "originator",
   "session_id",
   "session-id",
@@ -37,8 +40,11 @@ const CHATGPT_FORWARDED_REQUEST_HEADERS = new Set([
   "x-openai-internal-codex-residency",
   "x-openai-internal-codex-responses-lite",
   "x-openai-memgen-request",
+  "x-openai-scoped-session-id",
   "x-openai-subagent",
+  "x-openai-thread-id",
   "x-responsesapi-include-timing-metrics",
+  "x-session-id",
 ]);
 
 const DEEPSEEK_FORWARDED_REQUEST_HEADERS = new Set(["user-agent"]);
@@ -60,6 +66,10 @@ const DEFAULT_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 128 * 1024 * 1024;
 const SHUTDOWN_HEADER = "x-dscodex-shutdown-token";
 const SHUTDOWN_PATH = "/_dscodex/shutdown";
+const LIVE_PATH = "/v1/live";
+const LIVE_SIDEBAND_PATH = /^\/v1\/live\/([A-Za-z0-9][A-Za-z0-9_-]{0,255})$/;
+const LEGACY_REALTIME_SIDEBAND_PATH = "/v1/realtime";
+const REALTIME_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/;
 const COMPACTION_PREFIX = "dscodex-compaction-v1:";
 const COMPACTION_PROMPT = [
   "Create a compact handoff summary of the conversation above for the next model turn.",
@@ -400,6 +410,14 @@ function authorizedPath(pathname, routerToken) {
   return firstSlash === -1 ? "/" : pathname.slice(firstSlash) || "/";
 }
 
+function parseRequestUrl(request) {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1");
+  } catch {
+    return null;
+  }
+}
+
 function copyRequestHeaders(request, deepSeekKey) {
   const headers = new Headers();
   const forwarded = deepSeekKey
@@ -415,10 +433,103 @@ function copyRequestHeaders(request, deepSeekKey) {
   return headers;
 }
 
+function copyWebSocketRequestHeaders(request) {
+  const headers = {};
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (value === undefined) continue;
+    if (
+      CHATGPT_FORWARDED_REQUEST_HEADERS.has(name)
+      || name === "origin"
+      || name.startsWith("sec-websocket-")
+    ) {
+      headers[name] = value;
+    }
+  }
+  headers.connection = "Upgrade";
+  headers.upgrade = "websocket";
+  return headers;
+}
+
+// The /backend-api/realtime/calls endpoint sits behind stricter Cloudflare
+// protection than /responses: it wants the desktop client's session cookies,
+// integrity-state and DeviceCheck headers, not just the OAuth allowlist.
+// Forward everything the client sent (minus hop-by-hop and the loopback Host).
+function copyLiveRequestHeaders(request) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (value === undefined) continue;
+    if (name === "host" || name === "content-length" || HOP_BY_HOP_HEADERS.has(name)) continue;
+    headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  return headers;
+}
+
+// The desktop client creates voice calls by POSTing a multipart body with an
+// `sdp` part and a JSON `session` part. The official backend only accepts the
+// JSON form ({ sdp, session }) at /backend-api/codex/realtime/calls, so parse
+// the multipart and re-encode it before forwarding.
+function buildLiveCallBody(raw, contentType) {
+  const match = /boundary=(?:"([^"]+)"|([^;,\s]+))/i.exec(contentType);
+  if (!match) {
+    const error = new Error("live call multipart is missing a boundary");
+    error.statusCode = 400;
+    throw error;
+  }
+  const boundary = Buffer.from(`--${match[1] ?? match[2]}`);
+  const parts = [];
+  let start = raw.indexOf(boundary);
+  while (start !== -1) {
+    const markerEnd = start + boundary.length;
+    // A trailing "--" marks the closing boundary; the loop ends with it.
+    if (raw[markerEnd] === 0x2d && raw[markerEnd + 1] === 0x2d) break;
+    let headerStart = markerEnd;
+    if (raw[headerStart] === 0x0d && raw[headerStart + 1] === 0x0a) headerStart += 2;
+    const headerEnd = raw.indexOf("\r\n\r\n", headerStart);
+    if (headerEnd === -1) break;
+    const bodyStart = headerEnd + 4;
+    const nextBoundary = raw.indexOf(boundary, bodyStart);
+    const bodyEnd = Math.max(bodyStart, (nextBoundary === -1 ? raw.length : nextBoundary) - 2);
+    const headerText = raw.subarray(headerStart, headerEnd).toString("utf8");
+    const nameMatch = /name="([^"]*)"/.exec(headerText);
+    if (nameMatch) parts.push({ name: nameMatch[1], body: raw.subarray(bodyStart, bodyEnd) });
+    start = nextBoundary;
+  }
+  const sdp = parts.find((part) => part.name === "sdp");
+  if (!sdp) {
+    const error = new Error("live call multipart is missing the sdp part");
+    error.statusCode = 400;
+    throw error;
+  }
+  const call = { sdp: sdp.body.toString("utf8") };
+  const session = parts.find((part) => part.name === "session");
+  if (session) call.session = JSON.parse(session.body.toString("utf8"));
+  return Buffer.from(JSON.stringify(call));
+}
+
 function copyResponseHeaders(upstream, response) {
   for (const [name, value] of upstream.headers) {
     if (!HOP_BY_HOP_HEADERS.has(name)) response.setHeader(name, value);
   }
+}
+
+function writeRawResponseHead(socket, response, { closeDelimited = false } = {}) {
+  const statusMessage = response.statusMessage ? ` ${response.statusMessage}` : "";
+  const lines = [`HTTP/1.1 ${response.statusCode}${statusMessage}`];
+  const omitted = closeDelimited
+    ? new Set(["connection", "content-length", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"])
+    : null;
+  if (omitted) {
+    for (const token of String(response.headers.connection ?? "").split(",")) {
+      const name = token.trim().toLowerCase();
+      if (name) omitted.add(name);
+    }
+  }
+  for (let index = 0; index < response.rawHeaders.length; index += 2) {
+    if (omitted?.has(response.rawHeaders[index].toLowerCase())) continue;
+    lines.push(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}`);
+  }
+  if (closeDelimited) lines.push("Connection: close");
+  socket.write(`${lines.join("\r\n")}\r\n\r\n`);
 }
 
 function json(response, status, value) {
@@ -438,6 +549,7 @@ export function createProxyServer({
   deepSeekKey = process.env.DEEPSEEK_API_KEY,
   deepSeekBaseUrl = DEEPSEEK_BASE_URL,
   chatGptBaseUrl = CHATGPT_CODEX_BASE_URL,
+  realtimeApiBaseUrl = OPENAI_REALTIME_BASE_URL,
   models = [],
   logger = console,
   visionModel,
@@ -453,7 +565,12 @@ export function createProxyServer({
   const vision = createVisionDescriber({ baseUrl: chatGptBaseUrl, model: visionModel, logger });
   const server = http.createServer(async (request, response) => {
     const startedAt = Date.now();
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    const url = parseRequestUrl(request);
+    if (!url) {
+      request.resume();
+      json(response, 400, { error: { message: "Invalid request target" } });
+      return;
+    }
     const pathname = authorizedPath(url.pathname, routerToken);
     if (!pathname) {
       json(response, 404, { error: { message: "Not found" } });
@@ -497,43 +614,82 @@ export function createProxyServer({
     let direction = "unknown";
     try {
       const raw = await readRequestBody(request, maxRequestBytes);
-      let decoded;
-      try {
-        decoded = decodeBody(raw, request.headers["content-encoding"], maxDecodedBytes);
-      } catch (error) {
-        if (error?.code === "ERR_BUFFER_TOO_LARGE") error.statusCode = 413;
-        throw error;
-      }
-      if (decoded.length > maxDecodedBytes) {
-        const error = new Error("Decoded request body exceeds the configured limit");
-        error.statusCode = 413;
-        throw error;
-      }
-      const parsed = JSON.parse(decoded.toString("utf8"));
-      const deepSeekModel = deepSeekModelFor(parsed.model);
-      const deepSeek = Boolean(deepSeekModel);
-      const compactionRequest = deepSeek && isCompactionRequest(parsed);
-      direction = compactionRequest ? "deepseek-compaction" : deepSeek ? "deepseek" : "chatgpt";
-      if (deepSeek && !deepSeekKey) {
-        json(response, 503, { error: { message: "DEEPSEEK_API_KEY is not configured in the DSCodex server process" } });
-        return;
-      }
+      let deepSeek = false;
+      let deepSeekModel = null;
+      let compactionRequest = false;
       let outgoingBody = raw;
-      if (deepSeek) {
-        const body = compactionRequest
-          ? buildDeepSeekCompactionBody(parsed, routerToken)
-          : buildDeepSeekBody(parsed, { compactionSecret: routerToken });
-        // DeepSeek V4 is text-only: borrow the caller's GPT OAuth to describe any
-        // attached images, then inject the descriptions as plain input_text.
-        const rewritten = await vision.rewriteImages(body, request.headers);
-        if (rewritten) logger.info?.(`vision: described ${rewritten} image(s) for ${pathname}`);
-        outgoingBody = Buffer.from(JSON.stringify(body));
+      let liveCallJson = false;
+      if (pathname === LIVE_PATH) {
+        // Voice/Realtime calls arrive as multipart (sdp + session); the official
+        // backend only accepts the JSON form, so convert it before forwarding.
+        // Non-multipart bodies (e.g. probes) are passed through unchanged.
+        direction = "chatgpt-live";
+        const contentType = request.headers["content-type"] ?? "";
+        if (contentType.toLowerCase().startsWith("multipart/form-data")) {
+          outgoingBody = buildLiveCallBody(raw, contentType);
+          liveCallJson = true;
+        }
+      } else {
+        let decoded;
+        try {
+          decoded = decodeBody(raw, request.headers["content-encoding"], maxDecodedBytes);
+        } catch (error) {
+          if (error?.code === "ERR_BUFFER_TOO_LARGE") error.statusCode = 413;
+          throw error;
+        }
+        if (decoded.length > maxDecodedBytes) {
+          const error = new Error("Decoded request body exceeds the configured limit");
+          error.statusCode = 413;
+          throw error;
+        }
+        const parsed = JSON.parse(decoded.toString("utf8"));
+        deepSeekModel = deepSeekModelFor(parsed.model);
+        deepSeek = Boolean(deepSeekModel);
+        compactionRequest = deepSeek && isCompactionRequest(parsed);
+        direction = compactionRequest ? "deepseek-compaction" : deepSeek ? "deepseek" : "chatgpt";
+        if (deepSeek && !deepSeekKey) {
+          json(response, 503, { error: { message: "DEEPSEEK_API_KEY is not configured in the DSCodex server process" } });
+          return;
+        }
+        if (deepSeek) {
+          const body = compactionRequest
+            ? buildDeepSeekCompactionBody(parsed, routerToken)
+            : buildDeepSeekBody(parsed, { compactionSecret: routerToken });
+          // DeepSeek V4 is text-only: borrow the caller's GPT OAuth to describe any
+          // attached images, then inject the descriptions as plain input_text.
+          const rewritten = await vision.rewriteImages(body, request.headers);
+          if (rewritten) logger.info?.(`vision: described ${rewritten} image(s) for ${pathname}`);
+          outgoingBody = Buffer.from(JSON.stringify(body));
+        }
       }
       const baseUrl = deepSeek ? deepSeekBaseUrl : chatGptBaseUrl;
-      const target = new URL(`${baseUrl.replace(/\/$/, "")}${upstreamPath(pathname)}${url.search}`);
-      const headers = copyRequestHeaders(request, deepSeek ? deepSeekKey : undefined);
+      const isLiveCall = pathname === LIVE_PATH;
+      // The desktop app's voice mode creates WebRTC calls on the official
+      // realtime/calls route; no other candidate is valid. The official
+      // client marks these calls with the AVAS query params, and the
+      // backend gate reads the same values from the OpenAI-Alpha header.
+      const liveCallBase = baseUrl.replace(/\/codex\/?$/, "").replace(/\/$/, "");
+      const target = new URL(
+        `${isLiveCall ? `${liveCallBase}/codex/realtime/calls` : `${baseUrl.replace(/\/$/, "")}${upstreamPath(pathname)}`}${url.search}`,
+      );
+      if (isLiveCall) {
+        target.searchParams.set("intent", "quicksilver");
+        target.searchParams.set("architecture", "avas");
+      }
+      const headers = isLiveCall
+        ? copyLiveRequestHeaders(request)
+        : copyRequestHeaders(request, deepSeek ? deepSeekKey : undefined);
+      if (isLiveCall) {
+        // The desktop client does not send this header through the router;
+        // the backend gate requires it to name the quicksilver protocol
+        // version; the AVAS call architecture requires v2.
+        headers.set("openai-alpha", "quicksilver=v2");
+      }
       if (!deepSeek && request.headers["content-encoding"]) {
         headers.set("content-encoding", request.headers["content-encoding"]);
+      }
+      if (isLiveCall && request.headers["content-type"]) {
+        headers.set("content-type", liveCallJson ? "application/json" : request.headers["content-type"]);
       }
       headers.set("content-length", String(outgoingBody.length));
 
@@ -543,6 +699,9 @@ export function createProxyServer({
       response.on("close", () => {
         if (!response.writableFinished) controller.abort();
       });
+      if (isLiveCall) {
+        logger.info?.(`live ${pathname} -> ${target.host}${target.pathname}`);
+      }
       const upstream = await fetch(target, {
         method: "POST",
         headers,
@@ -596,12 +755,95 @@ export function createProxyServer({
   // headersTimeout must stay above keepAliveTimeout.
   server.keepAliveTimeout = 120_000;
   server.headersTimeout = 125_000;
-  server.on("upgrade", (_request, socket) => {
+  const upgradeSockets = new Set();
+  server.closeUpgradeConnections = () => {
+    for (const socket of upgradeSockets) socket.destroy();
+  };
+  server.on("upgrade", (request, socket, clientHead) => {
     // Handling `upgrade` detaches the socket from the server's own error
     // handling, so an ECONNRESET here raised an unhandled 'error' event and
     // killed the whole router — Codex then sat in "reconnecting" forever.
     socket.on("error", () => {});
-    socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+    upgradeSockets.add(socket);
+    socket.once("close", () => upgradeSockets.delete(socket));
+    const url = parseRequestUrl(request);
+    if (!url) {
+      logger.info?.("upgrade <malformed> -> 400");
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    const pathname = authorizedPath(url.pathname, routerToken);
+    if (!pathname) {
+      logger.info?.("upgrade <unauthorized> -> 404");
+      socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    const liveSideband = LIVE_SIDEBAND_PATH.exec(pathname);
+    const legacyCallIds = pathname === LEGACY_REALTIME_SIDEBAND_PATH
+      ? url.searchParams.getAll("call_id")
+      : [];
+    const legacySideband = legacyCallIds.length === 1 && REALTIME_CALL_ID.test(legacyCallIds[0]);
+    if (pathname !== "/v1/responses" && !liveSideband && !legacySideband) {
+      const rejectedRouteLabel = pathname.startsWith(`${LIVE_PATH}/`)
+        ? "/v1/live/<invalid>"
+        : pathname;
+      logger.info?.(`upgrade ${rejectedRouteLabel} -> 426`);
+      socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
+    const routeLabel = liveSideband ? "/v1/live/<call>" : pathname;
+    const target = new URL(liveSideband
+      ? `${realtimeApiBaseUrl.replace(/\/$/, "")}/live/${liveSideband[1]}${url.search}`
+      : legacySideband
+        ? `${realtimeApiBaseUrl.replace(/\/$/, "")}/realtime${url.search}`
+        : `${chatGptBaseUrl.replace(/\/$/, "")}${upstreamPath(pathname)}${url.search}`);
+    const transport = target.protocol === "https:" ? https : target.protocol === "http:" ? http : null;
+    if (!transport) {
+      logger.error?.(`websocket proxy error (${routeLabel}): unsupported upstream protocol ${target.protocol}`);
+      socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      return;
+    }
+
+    const targetPathLabel = liveSideband ? "/v1/live/<call>" : target.pathname;
+    logger.info?.(`upgrade ${routeLabel} -> ${target.host}${targetPathLabel}`);
+    let upstreamSocket;
+    const upstreamRequest = transport.request(target, {
+      method: "GET",
+      headers: copyWebSocketRequestHeaders(request),
+    });
+    upstreamRequest.on("upgrade", (upstreamResponse, upgradedSocket, upstreamHead) => {
+      upstreamSocket = upgradedSocket;
+      upgradedSocket.on("error", () => socket.destroy());
+      logger.info?.(`upgrade ${routeLabel} -> ${upstreamResponse.statusCode}`);
+      writeRawResponseHead(socket, upstreamResponse);
+      if (clientHead.length > 0) upgradedSocket.write(clientHead);
+      if (upstreamHead.length > 0) socket.write(upstreamHead);
+      socket.pipe(upgradedSocket);
+      upgradedSocket.pipe(socket);
+    });
+    upstreamRequest.on("response", (upstreamResponse) => {
+      logger.info?.(`upgrade ${routeLabel} -> ${upstreamResponse.statusCode}`);
+      // IncomingMessage has already removed HTTP chunk frames. Do not copy
+      // its original framing headers onto the decoded stream; delimit the
+      // rejection body by closing the client connection instead.
+      writeRawResponseHead(socket, upstreamResponse, { closeDelimited: true });
+      const closeTruncatedClient = () => socket.destroy();
+      upstreamResponse.once("aborted", closeTruncatedClient);
+      upstreamResponse.once("error", closeTruncatedClient);
+      upstreamResponse.pipe(socket);
+    });
+    upstreamRequest.on("error", (error) => {
+      logger.error?.(`websocket proxy error (${routeLabel}): ${error instanceof Error ? error.message : String(error)}`);
+      if (!socket.destroyed) {
+        socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+      }
+    });
+    socket.once("close", () => {
+      if (upstreamSocket) upstreamSocket.destroy();
+      else upstreamRequest.destroy();
+    });
+    upstreamRequest.end();
   });
   return server;
 }
