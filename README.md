@@ -131,7 +131,7 @@ http://127.0.0.1:10110/<router-token>/v1   ← DSCodex 本地路由
 - **GPT 识图。** 借用请求自带的 OAuth 头，无需额外 key。无 OAuth 时图片原样透传。默认模型 `gpt-5.6-sol`，`DSCODEX_VISION_MODEL` 可换。
 - **Key 存储、代理解析、bridge 细节、平台差异。** 详见 `AGENTS.md`。
 - **Voice / Pets / 插件 / 技能 / MCP。** 均为客户端功能；Voice 由 GPT-Live 驱动，不会路由到 DeepSeek。
-- **DeepSeek → GPT 任务历史。** 同一任务从 DeepSeek 切回 GPT 时，历史中的明文 `reasoning_text` 目前可能导致 GPT 请求返回 400；见 [#17](https://github.com/fish2lab/DSCodex/issues/17)。切回 DeepSeek 或新建 GPT 任务可继续使用。
+- **DeepSeek → GPT 任务历史。** 同一任务在 DeepSeek 与 GPT 之间切换是安全的：发送 GPT 请求前，DSCodex 会剥离 DeepSeek 特有的明文 `reasoning` 项（`reasoning_text` 形状且 `encrypted_content: null`），不会将其转发给 ChatGPT。用户的 rollout JSONL 保持原样，不含此类项的普通 GPT 流量仍按字节透传。
 
 ## 卸载
 

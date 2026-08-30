@@ -130,7 +130,7 @@ Yes. Tool calls and web search use DeepSeek's Responses API. Because the text-on
 - **GPT vision.** Borrows the request's ChatGPT OAuth headers (no extra key). Without OAuth headers images pass through untouched. Default model `gpt-5.6-sol`, override with `DSCODEX_VISION_MODEL`.
 - **Key storage, proxy resolution, bridge details, platform differences.** See `AGENTS.md`.
 - **Voice / Pets / plugins / skills / MCP.** All client-side; Voice runs on GPT-Live and is never routed to DeepSeek.
-- **DeepSeek → GPT thread history.** Switching an existing task from DeepSeek back to GPT can currently leave plaintext `reasoning_text` in history and cause a persistent GPT 400 response; see [#17](https://github.com/fish2lab/DSCodex/issues/17). Switching back to DeepSeek or starting a new GPT task remains available.
+- **DeepSeek → GPT thread history.** Switching an existing task between DeepSeek and GPT is safe: before a GPT-bound request, DSCodex strips DeepSeek-only plaintext `reasoning` items (the `reasoning_text` shape with `encrypted_content: null`) so they are never forwarded to ChatGPT. The rollout JSONL is left untouched, and plain GPT traffic without such items still passes through byte-for-byte.
 
 ## Uninstall
 
