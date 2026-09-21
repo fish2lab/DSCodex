@@ -759,6 +759,42 @@ test("gives each parallel tool call its own reasoning without leaking it into la
   assert.equal(sequential.input.filter((item) => item.type === "reasoning").length, 1);
 });
 
+test("repairs mixed function and tool-search calls from one reasoning turn", () => {
+  const body = buildDeepSeekBody({
+    model: "deepseek/deepseek-v4-flash",
+    input: [
+      say("user", "u1"),
+      think("r1"),
+      { type: "function_call", call_id: "c1", name: "write_stdin", arguments: "{}" },
+      {
+        type: "tool_search_call",
+        call_id: "c2",
+        execution: "client",
+        arguments: { query: "spreadsheet tool" },
+      },
+      { type: "function_call_output", call_id: "c1", output: "still running" },
+      {
+        type: "tool_search_output",
+        call_id: "c2",
+        status: "completed",
+        execution: "client",
+        tools: [],
+      },
+    ],
+  });
+
+  assert.deepEqual(shape(body.input), [
+    "user:u1",
+    "reasoning:r1",
+    "function_call:c1",
+    "function_call_output:c1",
+    "reasoning:r1",
+    "tool_search_call:c2",
+    "tool_search_output:c2",
+  ]);
+
+  assert.notEqual(body.input[1], body.input[4]);
+});
 test("never asks DeepSeek for parallel tool calls", () => {
   const body = buildDeepSeekBody({
     model: "deepseek/deepseek-v4-flash",

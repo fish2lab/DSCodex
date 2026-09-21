@@ -246,6 +246,7 @@ const CALL_OUTPUT_TYPES = new Map([
   ["function_call", "function_call_output"],
   ["custom_tool_call", "custom_tool_call_output"],
   ["local_shell_call", "local_shell_call_output"],
+  ["tool_search_call", "tool_search_output"],
 ]);
 
 // DeepSeek also rejects a replayed assistant turn that carries more than one tool
