@@ -3,17 +3,14 @@
 > Open-source multi-model router for OpenAI Codex that runs only on the user's machine. It adds DeepSeek V4.1 Flash to the stock ChatGPT desktop app, Codex CLI, and Codex IDE extension, and keeps GPT models on ChatGPT OAuth. DeepSeek traffic uses the native Responses API. No fork, no app patch.
 
 - Canonical repository: https://github.com/fish2lab/DSCodex
-- Latest release: v1.2.2 "Spawn and Switch" (2026-09-20) — https://github.com/fish2lab/DSCodex/releases/tag/v1.2.2
+- Latest release: v1.3.0 "Live Model List" (2026-09-23) — https://github.com/fish2lab/DSCodex/releases/tag/v1.3.0
 - License: MIT
 - Runtime: Node.js >= 24.5, one runtime dependency (`ws`) for the Responses WebSocket server
 - Default loopback: `http://127.0.0.1:10110/<router-token>/v1`
 
 ## What it is
 
-DSCodex writes two marker-owned keys into `~/.codex/config.toml`:
-
-1. `openai_base_url` — the token-authenticated loopback router
-2. `model_catalog_json` — a merged catalog that inserts `🐳 DeepSeek Flash` into the native picker
+DSCodex writes one marker-owned key into `~/.codex/config.toml`: `openai_base_url`, the token-authenticated loopback router. Codex fetches `/models` through that router, which forwards the request to ChatGPT with the client's own OAuth headers and inserts `🐳 DeepSeek Flash` into the live list, so new GPT models appear without reinstalling. The last good list is kept at `~/.codex/dscodex-models.json` and served only when ChatGPT is unreachable. The static `model_catalog_json` key written by v1.2.2 and earlier froze the GPT list at install time; `start` removes it.
 
 Traffic splits by model name. `deepseek/deepseek-flash` (and the legacy names `deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`) go to `https://api.deepseek.com/responses` over HTTP. DeepSeek websocket upgrades are closed so the client falls back to that HTTP path; they are never forwarded to OpenAI. Every other model, including GPT, is forwarded to `https://chatgpt.com/backend-api/codex` with the original OAuth headers. ChatGPT desktop 26.908+ dials `ws://127.0.0.1:10110/<token>/v1/responses` first; DSCodex proxies that upgrade to `wss://chatgpt.com/backend-api/codex/responses`. If the loopback router is down, official GPT models show Reconnecting 1/5…5/5.
 
@@ -77,7 +74,7 @@ Q: Why does ChatGPT desktop reconnect 5/5 on official GPT models after installin
 A: The app prefers Responses WebSocket to the configured `openai_base_url`. Start the router (`node src/cli.mjs start`, then `autostart enable`). GPT upgrades are proxied to chatgpt.com; DeepSeek stays on HTTP Responses.
 
 Q: Does DSCodex modify the ChatGPT or Codex binaries?
-A: No. It owns only `openai_base_url`, `model_catalog_json`, and the `~/.codex/dscodex/` directory.
+A: No. It owns only `openai_base_url`, the fallback model list `~/.codex/dscodex-models.json`, and the `~/.codex/dscodex/` directory.
 
 Q: Which DeepSeek model is in the picker after v1.2.0?
 A: One entry, DeepSeek V4.1 Flash, wire name `deepseek-flash`. Legacy Flash / Pro names still route there.

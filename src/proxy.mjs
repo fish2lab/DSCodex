@@ -9,6 +9,7 @@ import {
 } from "node:crypto";
 import { brotliDecompressSync, gunzipSync, inflateSync, zstdDecompressSync } from "node:zlib";
 import { Readable } from "node:stream";
+import { buildCatalog } from "./catalog.mjs";
 import {
   CHATGPT_CODEX_BASE_URL,
   DEEPSEEK_BASE_URL,
@@ -537,6 +538,57 @@ function copyResponseHeaders(upstream, response) {
   }
 }
 
+const MAX_MODELS_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MODELS_TIMEOUT_MS = 15_000;
+
+// Codex refreshes /models itself (TTL plus the X-Models-Etag header on every
+// response), so the router serves the live ChatGPT list with Flash merged in.
+// `fallback` is the last good merged list; it only answers when ChatGPT is
+// unreachable or failing. Auth errors pass through so Codex can refresh login.
+async function serveModels({ request, response, url, chatGptBaseUrl, fallback, logger }) {
+  const target = new URL(`${chatGptBaseUrl.replace(/\/$/, "")}/models${url.search}`);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (!CHATGPT_FORWARDED_REQUEST_HEADERS.has(name) || value === undefined) continue;
+    headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  headers.set("accept", "application/json");
+  let status = 502;
+  try {
+    const upstream = await fetch(target, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(MODELS_TIMEOUT_MS),
+    });
+    status = upstream.status;
+    const body = Buffer.from(await upstream.arrayBuffer());
+    if (body.length > MAX_MODELS_RESPONSE_BYTES) throw new Error("ChatGPT /models response is too large");
+    if (upstream.ok) {
+      const catalog = buildCatalog(JSON.parse(body.toString("utf8")));
+      const etag = upstream.headers.get("etag");
+      if (etag) response.setHeader("etag", etag);
+      json(response, 200, catalog);
+      logger.info?.(`chatgpt /models -> ${status} (${catalog.models.length} models)`);
+      return catalog;
+    }
+    if (status < 500) {
+      response.writeHead(status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      response.end(body);
+      logger.info?.(`chatgpt /models -> ${status}`);
+      return null;
+    }
+  } catch (error) {
+    logger.error?.(`chatgpt /models failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (fallback.length) {
+    logger.info?.(`chatgpt /models -> ${status}; serving last good list (${fallback.length} models)`);
+    json(response, 200, { models: fallback });
+  } else {
+    json(response, 502, { error: { message: "DSCodex could not fetch the ChatGPT model list" } });
+  }
+  return null;
+}
+
 function json(response, status, value) {
   const body = Buffer.from(`${JSON.stringify(value)}\n`);
   response.writeHead(status, {
@@ -555,6 +607,7 @@ export function createProxyServer({
   deepSeekBaseUrl = DEEPSEEK_BASE_URL,
   chatGptBaseUrl = CHATGPT_CODEX_BASE_URL,
   models = [],
+  onModelsRefreshed,
   logger = console,
   routerToken,
   shutdownToken = "",
@@ -608,7 +661,15 @@ export function createProxyServer({
       return;
     }
     if (request.method === "GET" && (pathname === "/models" || pathname === "/v1/models")) {
-      json(response, 200, { models });
+      const catalog = await serveModels({ request, response, url, chatGptBaseUrl, fallback: models, logger });
+      if (catalog) {
+        models = catalog.models;
+        try {
+          onModelsRefreshed?.(catalog);
+        } catch (error) {
+          logger.error?.(`saving model list failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       return;
     }
     if (request.method !== "POST") {

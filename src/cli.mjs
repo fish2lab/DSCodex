@@ -16,7 +16,7 @@ import { request as httpRequest } from "node:http";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { buildCatalog, isCatalogReady, syncCatalog } from "./catalog.mjs";
+import { buildCatalog, isCatalogReady, syncCatalog, writeCatalog } from "./catalog.mjs";
 import {
   ensureManagedRouterBinding,
   install,
@@ -504,6 +504,8 @@ async function serve(port) {
   server = createProxyServer({
     deepSeekKey,
     models: loadModels(paths),
+    // Keep the last good live list on disk as the offline fallback.
+    onModelsRefreshed: (catalog) => writeCatalog({ catalogPath: paths.catalog, catalog }),
     logger,
     routerToken,
     shutdownToken,
@@ -1172,8 +1174,8 @@ function usage() {
 
 Usage: dscodex <command> [--port ${DEFAULT_PORT}]
 
-  install     merge 🐳 DeepSeek Flash into the Codex model catalog
-  sync        refresh native GPT entries in the merged catalog
+  install     route Codex through DSCodex; the live GPT list gains 🐳 DeepSeek Flash
+  sync        rebuild the offline fallback model list from models_cache.json
   key set     store the DeepSeek API key (hidden prompt, or DEEPSEEK_API_KEY env)
   key status  show where the DeepSeek key comes from
   key delete  remove the stored DeepSeek key

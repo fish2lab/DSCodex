@@ -43,7 +43,7 @@ child.stdout.on("data", (chunk) => {
     }
     if (message.id === 2) {
       assert.ok(
-        message.result?.data?.some((item) => item.model === "gpt-5.6-sol"),
+        message.result?.data?.some((item) => item.model.startsWith("gpt-")),
         "native GPT catalog entries were not preserved",
       );
       const expected = [

@@ -116,7 +116,10 @@ export function buildCatalog(cache) {
   if (nativeModels.length === 0) {
     throw new Error("Codex models_cache.json has no native model template; open Codex once, then retry");
   }
-  const template = nativeModels.find((model) => model?.slug === "gpt-5.6-sol") ?? nativeModels[0];
+  // Upstream retires models, so fall back to any listed model as the template.
+  const template = nativeModels.find((model) => model?.slug === "gpt-5.6-sol")
+    ?? nativeModels.find((model) => model?.visibility === "list")
+    ?? nativeModels[0];
   return {
     models: [
       ...DEEPSEEK_MODELS.map((model) => buildDeepSeekCatalogEntry(template, model)),

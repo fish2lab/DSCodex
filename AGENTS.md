@@ -25,9 +25,19 @@ The non-negotiable details:
    `codex -m deepseek/deepseek-flash -c 'model_reasoning_effort="max"' -a never exec --skip-git-repo-check 'call a shell tool exactly once …'`.
    The legacy identifiers `deepseek-v4-flash`, `deepseek-v4-pro`, and `deepseek-v4-flash-vision-exp`
    must keep routing to `deepseek-flash` so resumed tasks still work.
-6. Do not edit `~/.codex/config.toml` by hand unless the user asks. The CLI owns exactly two
-   marker-owned root keys, `openai_base_url` and `model_catalog_json`. GUI-written `model` /
-   `model_reasoning_effort` lines are user-owned and must be preserved.
+6. Do not edit `~/.codex/config.toml` by hand unless the user asks. The CLI owns exactly one
+   marker-owned root key, `openai_base_url`. GUI-written `model` / `model_reasoning_effort` lines
+   are user-owned and must be preserved. Codex rewrites the file and can drop the marker comment,
+   so a root `openai_base_url` of the tokenized loopback form `http://127.0.0.1:<port>/<token>/v1`
+   and a root `model_catalog_json` pointing at `dscodex-models.json` are DSCodex-owned by value;
+   `start` re-marks them and `uninstall` removes them. Never write `model_catalog_json`: Codex reads
+   a static catalog once at startup and never refreshes it, which froze the GPT list at install
+   time and hid every model OpenAI shipped later. `start` removes the key left by v1.2.2 and earlier.
+6a. `GET /models` forwards to `chatgpt.com/backend-api/codex/models` with the client's query string
+   (`client_version` decides which models ChatGPT returns) and its forwarded OAuth headers, merges
+   the DeepSeek entry, and keeps the upstream `etag`. Upstream 4xx pass through unchanged so Codex
+   can refresh its login; network errors and 5xx serve the last good list from
+   `~/.codex/dscodex-models.json`, which every successful fetch rewrites.
 
 ## Model, effort, and vision
 
@@ -145,7 +155,7 @@ The non-negotiable details:
 
 ## Platform and client boundaries
 
-19. Routing, key storage, and catalog merging work identically on all platforms. Windows config
+19. Routing, key storage, and model-list merging work identically on all platforms. Windows config
     lives under `%USERPROFILE%\.codex`; `0600` file permissions do not apply on NTFS, so DSCodex
     relies on the user account ACL there. Autostart uses the platform-native scheduler on all three
     OSes (launchd / systemd / Task Scheduler + VBS). The app-server bridge is macOS-only (see 10–12).

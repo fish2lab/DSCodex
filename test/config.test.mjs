@@ -72,7 +72,9 @@ test("config injection is root-correct, reversible, and preserves user config", 
   const original = 'personality = "pragmatic"\n\n[features]\nmulti_agent = true\n\n[desktop]\ntheme = "light"\n';
   const installed = buildInstalledConfig(original, { port: 10110, catalogPath: "/tmp/models.json", routerToken: ROUTER_TOKEN });
   assert.ok(installed.indexOf("openai_base_url") < installed.indexOf("[features]"));
-  assert.match(installed, /model_catalog_json = "\/tmp\/models\.json"/);
+  // A static model_catalog_json freezes the picker at install time; Codex must
+  // fetch /models through the router so new GPT models show up.
+  assert.doesNotMatch(installed, /model_catalog_json/);
   assert.match(installed, /enabled-reasoning-efforts = \[.*"max".*\]/);
   assert.equal(readManagedRouterToken(installed), ROUTER_TOKEN);
   assert.equal(managedRouterConfigMatches(installed, {
@@ -173,6 +175,88 @@ test("install and uninstall touch only DSCodex-owned files and lines", () => {
   assert.equal(existsSync(paths.bridgeShim), false);
   assert.equal(readFileSync(paths.config, "utf8"), original);
   assert.equal(readFileSync(paths.backup, "utf8"), original);
+});
+
+test("start migrates an install off the frozen static model catalog", () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-binding-catalog-"));
+  const paths = pathsFor(codexHome);
+  writeFileSync(paths.config, [
+    'model = "gpt-6-astra"',
+    "# DSCodex managed; remove with `dscodex uninstall`",
+    `openai_base_url = "http://127.0.0.1:10110/${ROUTER_TOKEN}/v1"`,
+    `model_catalog_json = ${JSON.stringify(paths.catalog)}`,
+    "",
+    "[features]",
+    "hooks = true",
+    "",
+  ].join("\n"));
+
+  const result = ensureManagedRouterBinding({ paths, port: 10110 });
+  const updated = readFileSync(paths.config, "utf8");
+  assert.equal(result.updated, true);
+  assert.equal(result.routerToken, ROUTER_TOKEN);
+  assert.doesNotMatch(updated, /model_catalog_json/);
+  assert.match(updated, new RegExp(`^openai_base_url = "http://127\\.0\\.0\\.1:10110/${ROUTER_TOKEN}/v1"$`, "m"));
+  assert.match(updated, /^model = "gpt-6-astra"$/m);
+  assert.equal(ensureManagedRouterBinding({ paths, port: 10110 }).updated, false);
+});
+
+// Codex rewrites config.toml and can drop the marker comment; real configs then
+// carry DSCodex lines with nothing marking them.
+const UNMARKED_INSTALL = (catalogPath) => [
+  'model = "gpt-6-astra"',
+  'personality = "pragmatic"',
+  `openai_base_url = "http://127.0.0.1:10110/${ROUTER_TOKEN}/v1"`,
+  `model_catalog_json = ${JSON.stringify(catalogPath)}`,
+  "",
+  "[desktop]",
+  'enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]',
+  "",
+].join("\n");
+
+test("uninstall removes DSCodex lines even after Codex dropped the marker", () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-unmarked-"));
+  const paths = pathsFor(codexHome);
+  writeFileSync(paths.config, UNMARKED_INSTALL(paths.catalog));
+  writeFileSync(paths.catalog, "{}\n");
+
+  uninstall({ paths });
+  const remaining = readFileSync(paths.config, "utf8");
+  assert.doesNotMatch(remaining, /openai_base_url|model_catalog_json/);
+  assert.match(remaining, /^model = "gpt-6-astra"$/m);
+  assert.match(remaining, /^personality = "pragmatic"$/m);
+  assert.match(remaining, /enabled-reasoning-efforts/);
+  assert.equal(existsSync(paths.catalog), false);
+});
+
+test("start re-adopts an unmarked install and restores its marker", () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-unmarked-start-"));
+  const paths = pathsFor(codexHome);
+  writeFileSync(paths.config, UNMARKED_INSTALL(paths.catalog));
+
+  const result = ensureManagedRouterBinding({ paths, port: 10110 });
+  const updated = readFileSync(paths.config, "utf8");
+  assert.equal(result.routerToken, ROUTER_TOKEN);
+  assert.equal(updated.match(/^openai_base_url = /gm).length, 1);
+  assert.doesNotMatch(updated, /model_catalog_json/);
+  assert.match(updated, /DSCodex managed/);
+  assert.match(updated, /enabled-reasoning-efforts/);
+});
+
+test("uninstall keeps user-owned base URL and catalog lines", () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "dscodex-user-owned-"));
+  const paths = pathsFor(codexHome);
+  const original = [
+    'openai_base_url = "https://example.test/v1"',
+    'model_catalog_json = "/Users/me/my-models.json"',
+    "",
+    "[model_providers.local]",
+    'base_url = "http://127.0.0.1:10110/v1"',
+    "",
+  ].join("\n");
+  writeFileSync(paths.config, original);
+  uninstall({ paths });
+  assert.equal(readFileSync(paths.config, "utf8"), original);
 });
 
 test("refuses to replace a user-owned openai_base_url", () => {

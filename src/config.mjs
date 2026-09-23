@@ -7,7 +7,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, win32 } from "node:path";
 import { HOST, MANAGED_MARKER } from "./constants.mjs";
 import { buildCatalog, writeCatalog } from "./catalog.mjs";
 import {
@@ -17,7 +17,10 @@ import {
   readRouterToken,
 } from "./keys.mjs";
 
+// model_catalog_json is only recognized so older installs can be migrated off
+// it: a static catalog is read once at startup and freezes the GPT list.
 const ROOT_KEYS = new Set(["openai_base_url", "model_catalog_json"]);
+const CATALOG_FILE = "dscodex-models.json";
 const DESKTOP_KEY = "enabled-reasoning-efforts";
 const REASONING_EFFORTS = '["low", "medium", "high", "xhigh", "max", "ultra"]';
 
@@ -94,7 +97,6 @@ function managedRootLines(options) {
   return [
     MANAGED_MARKER,
     `openai_base_url = ${quoteToml(routerBaseUrl(options))}`,
-    `model_catalog_json = ${quoteToml(options.catalogPath)}`,
   ];
 }
 
@@ -109,25 +111,12 @@ function assignedString(line) {
   }
 }
 
-function managedRootBlock(content) {
+function hasManagedRootBlock(content) {
   const lines = content.replaceAll("\r\n", "\n").split("\n");
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].trim() !== MANAGED_MARKER) continue;
-    let next = index + 1;
-    if (!ROOT_KEYS.has(keyOf(lines[next] ?? ""))) continue;
-    const values = {};
-    while (next < lines.length && ROOT_KEYS.has(keyOf(lines[next]))) {
-      values[keyOf(lines[next])] = assignedString(lines[next]);
-      next += 1;
-    }
-    return { lines, start: index, end: next, values };
-  }
-  return null;
+  return lines.some((line, index) => line.trim() === MANAGED_MARKER && ROOT_KEYS.has(keyOf(lines[index + 1] ?? "")));
 }
 
-export function readManagedRouterToken(content) {
-  const baseUrl = managedRootBlock(content)?.values.openai_base_url;
-  if (!baseUrl) return "";
+function ownedRouterToken(baseUrl) {
   try {
     const parsed = new URL(baseUrl);
     const match = /^\/([A-Za-z0-9_-]{43})\/v1\/?$/.exec(parsed.pathname);
@@ -139,39 +128,73 @@ export function readManagedRouterToken(content) {
   }
 }
 
-export function managedRouterConfigMatches(content, options) {
-  const block = managedRootBlock(content);
-  if (!block) return false;
-  return block.values.openai_base_url === routerBaseUrl(options)
-    && block.values.model_catalog_json === options.catalogPath;
+// Codex rewrites config.toml and may drop the marker comment, so DSCodex also
+// recognizes its root lines by value: a tokenized loopback base URL and the
+// generated catalog file are never user-authored.
+function ownedRootLine(line) {
+  const key = keyOf(line);
+  const value = assignedString(line);
+  if (key === "openai_base_url") return Boolean(ownedRouterToken(value));
+  if (key === "model_catalog_json") return basename(value) === CATALOG_FILE || win32.basename(value) === CATALOG_FILE;
+  return false;
 }
 
-function rewriteManagedRouterConfig(content, options) {
-  const block = managedRootBlock(content);
-  if (!block) {
-    throw new Error("DSCodex managed router config is missing; run `node src/cli.mjs install`");
+export function readManagedRouterToken(content) {
+  const lines = content.replaceAll("\r\n", "\n").split("\n");
+  const rootEnd = firstTableIndex(lines);
+  for (let index = 0; index < rootEnd; index += 1) {
+    if (keyOf(lines[index]) !== "openai_base_url") continue;
+    const token = ownedRouterToken(assignedString(lines[index]));
+    if (token) return token;
   }
-  block.lines.splice(block.start, block.end - block.start, ...managedRootLines(options));
-  return block.lines.join("\n");
+  return "";
+}
+
+function stripOwnedLines(content, { desktop }) {
+  const lines = content.replaceAll("\r\n", "\n").split("\n");
+  const rootEnd = firstTableIndex(lines);
+  const kept = [];
+  let firstOwnedRoot = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (lines[index].trim() === MANAGED_MARKER && (desktop || index < rootEnd)) {
+      if (index < rootEnd) firstOwnedRoot ??= kept.length;
+      let next = index + 1;
+      while (next < lines.length) {
+        const key = keyOf(lines[next]);
+        if (!ROOT_KEYS.has(key) && key !== DESKTOP_KEY) break;
+        next += 1;
+      }
+      index = next - 1;
+      continue;
+    }
+    if (index < rootEnd && ownedRootLine(lines[index])) {
+      firstOwnedRoot ??= kept.length;
+      continue;
+    }
+    kept.push(lines[index]);
+  }
+  return { kept, firstOwnedRoot };
+}
+
+function collapseBlankRuns(lines) {
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+// Rewrite in place so a config that already matches is left byte-for-byte alone.
+function rewriteManagedRouterConfig(content, options) {
+  const { kept, firstOwnedRoot } = stripOwnedLines(content, { desktop: false });
+  kept.splice(firstOwnedRoot ?? firstTableIndex(kept), 0, ...managedRootLines(options));
+  return collapseBlankRuns(kept);
+}
+
+export function managedRouterConfigMatches(content, options) {
+  const normalized = content.replaceAll("\r\n", "\n");
+  if (!readManagedRouterToken(normalized)) return false;
+  return rewriteManagedRouterConfig(normalized, options) === normalized;
 }
 
 export function stripManagedConfig(content) {
-  const lines = content.replaceAll("\r\n", "\n").split("\n");
-  const kept = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].trim() !== MANAGED_MARKER) {
-      kept.push(lines[index]);
-      continue;
-    }
-    let next = index + 1;
-    while (next < lines.length) {
-      const key = keyOf(lines[next]);
-      if (!ROOT_KEYS.has(key) && key !== DESKTOP_KEY) break;
-      next += 1;
-    }
-    index = next - 1;
-  }
-  return kept.join("\n").replace(/\n{3,}/g, "\n\n");
+  return collapseBlankRuns(stripOwnedLines(content, { desktop: true }).kept);
 }
 
 function assertNoRootConflict(content) {
@@ -185,10 +208,10 @@ function assertNoRootConflict(content) {
   }
 }
 
-function injectRoot(content, { port, catalogPath, routerToken }) {
+function injectRoot(content, { port, routerToken }) {
   const lines = content.split("\n");
   const insertAt = firstTableIndex(lines);
-  lines.splice(insertAt, 0, ...managedRootLines({ port, catalogPath, routerToken }));
+  lines.splice(insertAt, 0, ...managedRootLines({ port, routerToken }));
   return lines.join("\n");
 }
 
@@ -260,7 +283,7 @@ export function ensureManagedRouterBinding({ paths, port }) {
   // the port and legacy pid state. `install` performs the same guard separately.
   assertNoActiveLegacyRouter(paths);
   const original = existsSync(paths.config) ? readFileSync(paths.config, "utf8") : "";
-  if (!managedRootBlock(original)) {
+  if (!hasManagedRootBlock(original) && !readManagedRouterToken(original)) {
     throw new Error("DSCodex managed router config is missing; run `node src/cli.mjs install`");
   }
   const routerToken = ensureRouterToken(paths.keyFile, readManagedRouterToken(original));

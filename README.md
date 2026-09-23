@@ -29,7 +29,7 @@
 
 **DSCodex 是一个开源、只在本机运行的 Codex 多模型路由器。** 它把 DeepSeek V4.1 Flash 加进 ChatGPT 桌面端、Codex CLI 和 IDE 扩展的原生模型菜单，同时保留 ChatGPT OAuth 登录和全部 GPT 模型。请求按模型名分流：DeepSeek 走原生 Responses API，GPT 继续经 `chatgpt.com` OAuth 原样转发。
 
-它不 fork、不 patch ChatGPT 或 Codex，也不是 chatgpt.com 网页版的插件。它只写入两个自己拥有的配置键，卸载时原样撤回。适合既有 DeepSeek API Key 又有 ChatGPT 订阅、不想在两者之间反复改配置或重新登录的人。
+它不 fork、不 patch ChatGPT 或 Codex，也不是 chatgpt.com 网页版的插件。它只写入一个自己拥有的配置键，卸载时原样撤回。适合既有 DeepSeek API Key 又有 ChatGPT 订阅、不想在两者之间反复改配置或重新登录的人。
 
 ### 与 DeepSeek 官方 Codex 接入的区别
 
@@ -147,7 +147,7 @@ ChatGPT 桌面端 26.908+ 会先连 `ws://127.0.0.1:10110/<token>/v1/responses`�
 
 ### DSCodex 会 fork 或修改 ChatGPT / Codex App 吗？
 
-不会。它不是 chatgpt.com 网页插件，也不 patch 桌面端。它只改两处自己写入的配置：`openai_base_url`（指向本机 `127.0.0.1:10110/<token>/v1`）和 `model_catalog_json`。
+不会。它不是 chatgpt.com 网页插件，也不 patch 桌面端。它只改一处自己写入的配置：`openai_base_url`（指向本机 `127.0.0.1:10110/<token>/v1`）。模型列表由路由器实时转发 ChatGPT 的 `/models` 并插入 `🐳 DeepSeek Flash`，所以 OpenAI 新上线或下架的 GPT 模型会跟着 Codex 自己的刷新出现或消失。v1.2.2 及更早版本写入的 `model_catalog_json` 会在下次 `start` 时自动删除。
 
 ### DSCodex 和 DSCode、DeepCodex 是同一个项目吗？
 

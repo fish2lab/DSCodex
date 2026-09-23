@@ -28,7 +28,7 @@
 
 **DSCodex is an open-source multi-model router for Codex that runs only on your machine.** It adds DeepSeek V4.1 Flash to the native model picker of the ChatGPT desktop app, Codex CLI, and the IDE extension while keeping ChatGPT OAuth and every GPT model. Traffic splits by model name: DeepSeek requests use the native Responses API, GPT requests pass through `chatgpt.com` OAuth untouched.
 
-It does not fork or patch ChatGPT or Codex, and it is not a plugin for the chatgpt.com web app. It writes exactly two config keys it owns and removes them on uninstall. It is for people who hold both a DeepSeek API key and a ChatGPT subscription and do not want to rewrite configuration or log in again every time they move between the two.
+It does not fork or patch ChatGPT or Codex, and it is not a plugin for the chatgpt.com web app. It writes exactly one config key it owns and removes it on uninstall. It is for people who hold both a DeepSeek API key and a ChatGPT subscription and do not want to rewrite configuration or log in again every time they move between the two.
 
 ### How it differs from DeepSeek's official Codex setup
 
@@ -146,7 +146,7 @@ The official script points all of Codex at a DeepSeek API key, so GPT OAuth mode
 
 ### Does DSCodex fork or patch ChatGPT / Codex?
 
-No. It is not a chatgpt.com web plugin and it does not patch the desktop app. It changes only the two keys it writes itself: `openai_base_url` (pointing at loopback `127.0.0.1:10110/<token>/v1`) and `model_catalog_json`.
+No. It is not a chatgpt.com web plugin and it does not patch the desktop app. It changes only the one key it writes itself: `openai_base_url` (pointing at loopback `127.0.0.1:10110/<token>/v1`). The router serves the live ChatGPT `/models` list with `🐳 DeepSeek Flash` merged in, so GPT models OpenAI adds or retires appear and disappear on Codex's own refresh. The `model_catalog_json` key written by v1.2.2 and earlier is removed on the next `start`.
 
 ### Is DSCodex the same project as DSCode or DeepCodex?
 

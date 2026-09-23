@@ -792,7 +792,7 @@ test("survives a client reset on an upgrade attempt", async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   // Still serving: an unhandled 'error' event would have killed this process.
-  const response = await fetch(route(proxyUrl, "/v1/models"));
+  const response = await fetch(route(proxyUrl, "/health"));
   assert.equal(response.status, 200);
 });
 
@@ -1281,4 +1281,90 @@ test("GPT-hinted upgrade still proxies to chatgpt.com", async (t) => {
   await opened;
   await waitUntil(() => upstream.state.sockets.length >= 1);
   assert.equal(upstream.state.sockets.length, 1);
+});
+
+const NATIVE_MODEL = {
+  slug: "gpt-6-luna",
+  display_name: "GPT-6-Luna",
+  visibility: "list",
+  supported_in_api: true,
+  priority: 1,
+  base_instructions: "You are Codex, based on GPT-5.",
+};
+
+async function modelsUpstream(t, handler) {
+  const seen = [];
+  const upstream = http.createServer((request, response) => {
+    seen.push({ url: request.url, headers: request.headers });
+    handler(request, response);
+  });
+  const upstreamUrl = await listen(upstream);
+  t.after(() => close(upstream));
+  return { seen, upstreamUrl: `${upstreamUrl}/backend-api/codex` };
+}
+
+async function modelsProxy(t, options) {
+  const proxy = createProxyServer({
+    logger: { info() {}, error() {} },
+    routerToken: ROUTER_TOKEN,
+    ...options,
+  });
+  const proxyUrl = await listen(proxy);
+  t.after(() => close(proxy));
+  return proxyUrl;
+}
+
+test("serves the live ChatGPT model list with Flash merged in", async (t) => {
+  const { seen, upstreamUrl } = await modelsUpstream(t, (request, response) => {
+    response.writeHead(200, { "content-type": "application/json", etag: 'W/"live"' });
+    response.end(JSON.stringify({ models: [NATIVE_MODEL, { ...NATIVE_MODEL, slug: "gpt-5.5" }] }));
+  });
+  const refreshed = [];
+  const proxyUrl = await modelsProxy(t, {
+    chatGptBaseUrl: upstreamUrl,
+    // Stale snapshot: gpt-6-astra has been retired upstream and must not survive.
+    models: [{ ...NATIVE_MODEL, slug: "gpt-6-astra" }],
+    onModelsRefreshed: (catalog) => refreshed.push(catalog),
+  });
+
+  const response = await fetch(route(proxyUrl, "/v1/models?client_version=0.155.0"), {
+    headers: { authorization: "Bearer chatgpt-oauth", "chatgpt-account-id": "acct", originator: "codex_cli_rs" },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("etag"), 'W/"live"');
+  const { models } = await response.json();
+  assert.deepEqual(models.map((model) => model.slug), ["deepseek/deepseek-flash", "gpt-6-luna", "gpt-5.5"]);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, "/backend-api/codex/models?client_version=0.155.0");
+  assert.equal(seen[0].headers.authorization, "Bearer chatgpt-oauth");
+  assert.equal(seen[0].headers["chatgpt-account-id"], "acct");
+  assert.ok(!seen[0].url.includes(ROUTER_TOKEN));
+  assert.deepEqual(refreshed.map((catalog) => catalog.models.length), [3]);
+});
+
+test("passes ChatGPT auth failures on /models through so Codex can refresh its login", async (t) => {
+  const { upstreamUrl } = await modelsUpstream(t, (request, response) => {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end('{"detail":"token expired"}');
+  });
+  const proxyUrl = await modelsProxy(t, { chatGptBaseUrl: upstreamUrl, models: [NATIVE_MODEL] });
+  const response = await fetch(route(proxyUrl, "/v1/models?client_version=0.155.0"));
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { detail: "token expired" });
+});
+
+test("falls back to the last good model list when ChatGPT is unreachable or failing", async (t) => {
+  const { upstreamUrl } = await modelsUpstream(t, (request, response) => {
+    response.writeHead(503);
+    response.end("down");
+  });
+  const fallback = [{ ...NATIVE_MODEL, slug: "deepseek/deepseek-flash" }, NATIVE_MODEL];
+  for (const chatGptBaseUrl of [upstreamUrl, "http://127.0.0.1:9/backend-api/codex"]) {
+    const proxyUrl = await modelsProxy(t, { chatGptBaseUrl, models: fallback });
+    const response = await fetch(route(proxyUrl, "/v1/models?client_version=0.155.0"));
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).models.map((model) => model.slug), ["deepseek/deepseek-flash", "gpt-6-luna"]);
+  }
+  const bare = await modelsProxy(t, { chatGptBaseUrl: upstreamUrl });
+  assert.equal((await fetch(route(bare, "/v1/models"))).status, 502);
 });

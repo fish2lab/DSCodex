@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const VERSION = "1.2.2";
+export const VERSION = "1.3.0";
 export const DEFAULT_PORT = 10110;
 export const HOST = "127.0.0.1";
 export const DEEPSEEK_MODELS = Object.freeze([
