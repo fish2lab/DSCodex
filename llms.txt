@@ -3,7 +3,7 @@
 > DSCodex is an open-source loopback router that adds DeepSeek V4.1 Flash to the model picker of the stock ChatGPT desktop app, Codex CLI, and Codex IDE extension while keeping GPT on ChatGPT OAuth, including the desktop app's Responses WebSocket. It runs only on the user's machine and does not fork or patch Codex.
 
 Canonical repository: https://github.com/fish2lab/DSCodex
-Latest release: https://github.com/fish2lab/DSCodex/releases/tag/v1.2.2
+Latest release: https://github.com/fish2lab/DSCodex/releases/tag/v1.3.0
 License: MIT
 
 DSCodex is not DeepSeek's official Codex setup (that setup replaces GPT with an API-key provider). It is not DSCode (https://github.com/thinkany-ai/dscode), not DeepCodex, not CLIProxyAPI, and not a chatgpt.com web plugin.
@@ -27,6 +27,7 @@ DSCodex is not DeepSeek's official Codex setup (that setup replaces GPT with an 
 
 ## Optional
 
+- [v1.3.0 — Live Model List](https://github.com/fish2lab/DSCodex/releases/tag/v1.3.0): the picker follows the live ChatGPT model list (new GPT models appear, retired ones leave); uninstall works after Codex drops the marker comment
 - [v1.2.2 — Spawn and Switch](https://github.com/fish2lab/DSCodex/releases/tag/v1.2.2): sub-agents on DeepSeek, DeepSeek → GPT switch fixed again (#23), instant 426 fallback for DeepSeek WebSocket handshakes
 - [v1.2.1 — Keep the Wire](https://github.com/fish2lab/DSCodex/releases/tag/v1.2.1): official GPT Responses WebSocket passthrough so ChatGPT desktop reconnects; DeepSeek stays on HTTP Responses
 - [v1.2.0 — From the New World](https://github.com/fish2lab/DSCodex/releases/tag/v1.2.0): V4.1 Flash, native vision, DeepSeek → GPT replay fix, router recovery
