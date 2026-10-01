@@ -32,6 +32,8 @@ import {
   writeProxyUrl,
   writeStoredKey,
 } from "./keys.mjs";
+import { compactionBudgetSource, compactionTunables } from "./compaction-limits.mjs";
+import { ImageTranscodeCache, loadWebpEncoder } from "./image-compaction.mjs";
 import {
   envProxySupported,
   proxyEnvFor,
@@ -489,6 +491,13 @@ async function serve(port) {
   };
   const shutdownToken = randomBytes(32).toString("base64url");
   const instanceId = `${process.pid}-${Date.now()}-${randomBytes(8).toString("hex")}`;
+  const { webpEncoderDir, ...compaction } = compactionTunables(paths);
+  // WebP transcodes are cached by content hash: the same picture is re-sent
+  // every turn, and encoding it again each time would be the whole cost of this
+  // feature. A missing encoder is normal, not fatal: DSCodex ships one runtime
+  // dependency (`ws`), and the encoder is something the environment provides.
+  const imageCache = new ImageTranscodeCache(join(paths.stateDir, "image-cache"));
+  const { encode: imageEncoder, source: encoderSource } = await loadWebpEncoder({ directory: webpEncoderDir });
   let server;
   let shuttingDown = false;
   const shutdown = () => {
@@ -511,6 +520,9 @@ async function serve(port) {
     shutdownToken,
     instanceId,
     onShutdown: shutdown,
+    ...compaction,
+    imageCache,
+    imageEncoder,
   });
   // The serve process owns the pid file so `stop` works no matter who launched
   // it — `start`, launchd, systemd, or the Windows Task Scheduler.
@@ -525,6 +537,18 @@ async function serve(port) {
     writePidState(paths, { pid: process.pid, port, routerToken, shutdownToken, instanceId });
     console.log(`${ts()} DSCodex ${VERSION} listening at http://${HOST}:${port}/v1`);
     console.log(`${ts()} DeepSeek key: ${deepSeekKey ? "configured" : "missing (GPT OAuth passthrough still works)"}`);
+    const budget = compaction.maxUpstreamBytes;
+    console.log(`${ts()} Image-history compaction: ${Number.isFinite(budget)
+      ? `bodies over ${(budget / 1048576).toFixed(0)}MB shrink the oldest images to WebP q${compaction.webpQuality}`
+        + ` at ${compaction.imageMaxSide}px, keeping the ${compaction.keepRecentImages} newest untouched`
+      : "disabled (max_upstream_bytes=0); oversized bodies will fail with 413"}`
+      + ` [budget from ${compactionBudgetSource(paths)}]`);
+    console.log(`${ts()} WebP encoder: ${encoderSource}${imageEncoder ? "" : " — oversized bodies fall back to text records"}`);
+    console.log(`${ts()} Compaction knobs: DSCODEX_MAX_UPSTREAM_BYTES / max_upstream_bytes (0 disables),`
+      + " DSCODEX_KEEP_RECENT_IMAGES / keep_recent_images, DSCODEX_IMAGE_MAX_SIDE / image_max_side,"
+      + " DSCODEX_WEBP_QUALITY / webp_quality, DSCODEX_WEBP_ENCODER_DIR / webp_encoder_dir — the stored ones live in"
+      + " ~/.codex/dscodex/config.json and are re-read on every router start, so restart-dscodex.ps1 applies them;"
+      + " a shell variable only reaches a manually started router.");
   });
 }
 

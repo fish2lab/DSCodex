@@ -45,6 +45,30 @@ The non-negotiable details:
    `input_image` parts in messages and in tool outputs directly to DeepSeek. The entry keeps
    `input_modalities = ["text", "image"]` so the desktop app may issue `view_image` calls. GPT
    image descriptions and `DSCODEX_VISION_MODEL` are not used by the router.
+
+   One carve-out to "forward natively", in `src/image-compaction.mjs`: Codex resends the whole
+   transcript every turn, images travel inside it as base64 that never shrinks, and the gateway
+   refuses bodies at ~47 MB, so a session that viewed enough pictures stops being sendable at all.
+   The answer is **shrink, don't delete**. Every image older than the
+   newest `keep_recent_images` is re-encoded to **lossy WebP** at `image_max_side` (default 1024)
+   before anything is sacrificed, so the model still sees every picture. Measured on a real
+   44-image session: 47.92 MB of image payload became 10.1 MB, the request went 50.67 → 12.88 MB,
+   nothing was deleted, and DeepSeek still read the dice faces and their numbers out of
+   2182 KB → 12 KB images. Deleting is only the last resort, and a deleted picture must leave an
+   `input_text` record naming its position, media type, and size — never a silent hole. The WebP
+   encoder is **found, never required**: this package ships exactly one runtime dependency (`ws`)
+   and that stays true. The router resolves `sharp` the same way it resolves `ws` — lazily, via
+   `createRequire` — from `webp_encoder_dir` / `DSCODEX_WEBP_ENCODER_DIR`, or from the documented
+   drop-in directory `~/.codex/dscodex/encoders`, and reports which one answered in the startup
+   banner. When nothing resolves it logs "WebP encoder unavailable" and falls back to the record
+   path rather than failing, so a fresh clone is slower, never broken. Never add the encoder to
+   `dependencies` or `optionalDependencies`: the promise is one runtime dependency, and
+   `npm install` would then fetch it. Transcoded bytes are cached by content hash under
+   `~/.codex/dscodex/image-cache/` because the same picture is re-sent every turn (cold 2.3 s vs
+   warm 0.24 s on that session). All five knobs — `max_upstream_bytes`, `keep_recent_images`,
+   `image_max_side`, `webp_quality`, `webp_encoder_dir` — resolve from the process environment and
+   then from `~/.codex/dscodex/config.json`, because the autostarted router never inherits a shell
+   variable; `max_upstream_bytes: 0` disables the compaction entirely.
 8. The hosted DeepSeek Responses API accepts only the string levels
    `none|minimal|low|medium|high|xhigh|max`; integer Juice values and `ultra` are rejected with
    HTTP 400. The catalog exposes exactly two stops, High (`high`) and Max (`max`, the default), and
