@@ -17,5 +17,7 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci
+      - run: for f in src/*.mjs scripts/*.mjs; do node --check "$f"; done
+        shell: bash
       - run: npm test
       - run: git diff --check
