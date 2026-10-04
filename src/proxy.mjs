@@ -20,6 +20,19 @@ import {
   handleResponsesUpgrade,
   rejectUpgrade,
 } from "./websocket-proxy.mjs";
+import {
+  collectImageParts,
+  compactImagesToBudget,
+  DEFAULT_IMAGE_MAX_SIDE,
+  DEFAULT_KEEP_RECENT_IMAGES,
+  DEFAULT_WEBP_EFFORT,
+  DEFAULT_WEBP_QUALITY,
+  shrinkImagesToBudget,
+} from "./image-compaction.mjs";
+
+// Kept exported from here because this module is the router's public surface and
+// the image tests are written against it.
+export { collectImageParts, compactImagesToBudget, imageRecordFor } from "./image-compaction.mjs";
 
 const CHATGPT_FORWARDED_REQUEST_HEADERS = new Set([
   "authorization",
@@ -80,6 +93,12 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 const DEFAULT_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 128 * 1024 * 1024;
+// Measured against api.deepseek.com on 2026-10-01: a 46 MB body is served, 47 MB
+// and above get an HTML "413 Request Entity Too Large" from the gateway. Codex
+// resends the whole transcript every turn and images travel as base64 that never
+// leaves it, so a session that accumulated screenshots stops working entirely.
+// 44 MB leaves headroom under the measured ceiling.
+const DEFAULT_MAX_UPSTREAM_BYTES = 44 * 1024 * 1024;
 const SHUTDOWN_HEADER = "x-dscodex-shutdown-token";
 const SHUTDOWN_PATH = "/_dscodex/shutdown";
 const COMPACTION_PREFIX = "dscodex-compaction-v1:";
@@ -616,6 +635,13 @@ export function createProxyServer({
   onShutdown,
   maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES,
   maxDecodedBytes = DEFAULT_MAX_DECODED_BYTES,
+  maxUpstreamBytes = DEFAULT_MAX_UPSTREAM_BYTES,
+  keepRecentImages = DEFAULT_KEEP_RECENT_IMAGES,
+  imageMaxSide = DEFAULT_IMAGE_MAX_SIDE,
+  webpQuality = DEFAULT_WEBP_QUALITY,
+  webpEffort = DEFAULT_WEBP_EFFORT,
+  imageCache = null,
+  imageEncoder = null,
   openWebSocket,
 } = {}) {
   if (!validRouterToken(routerToken)) throw new Error("DSCodex routerToken is required");
@@ -680,7 +706,13 @@ export function createProxyServer({
 
     let direction = "unknown";
     try {
-      const raw = await readRequestBody(request, maxRequestBytes);
+      const raw = await readRequestBody(request, maxRequestBytes).catch((error) => {
+        if (error?.statusCode === 413) {
+          error.message = `Request body exceeds DSCodex's ${(maxRequestBytes / 1048576).toFixed(0)}MB buffering limit;`
+            + " an upstream 413 means the same thing. Start a new chat: a session this large cannot be sent again.";
+        }
+        throw error;
+      });
       let decoded;
       try {
         decoded = decodeBody(raw, request.headers["content-encoding"], maxDecodedBytes);
@@ -715,6 +747,43 @@ export function createProxyServer({
         if (body) {
           outgoingBody = Buffer.from(JSON.stringify(body));
           rewrittenBody = true;
+        }
+      }
+      // The gateway refuses bodies over its ceiling with an HTML 413 that says
+      // nothing useful, so shrink oversized image history here, while the reason
+      // is still known and the client can be told what actually happened.
+      if (outgoingBody.length > maxUpstreamBytes) {
+        const budgetBody = deepSeek ? JSON.parse(outgoingBody.toString("utf8")) : null;
+        if (budgetBody) {
+          const shrunk = await shrinkImagesToBudget(budgetBody, maxUpstreamBytes, {
+            keepRecent: keepRecentImages,
+            maxSide: imageMaxSide,
+            quality: webpQuality,
+            effort: webpEffort,
+            cache: imageCache,
+            encode: imageEncoder,
+          });
+          outgoingBody = Buffer.from(JSON.stringify(budgetBody));
+          const kept = Math.min(keepRecentImages, shrunk.images);
+          const detail = shrunk.encoder === "unavailable"
+            ? `WebP encoder unavailable, replaced the oldest ${shrunk.dropped} of ${shrunk.images} images with text records`
+            : `shrank ${shrunk.transcoded} of ${shrunk.images} images to WebP q${webpQuality}/${imageMaxSide}px`
+              + (shrunk.fromCache ? ` (${shrunk.fromCache} from cache)` : "")
+              + (shrunk.dropped ? `, then replaced the oldest ${shrunk.dropped} with text records` : "");
+          logger.info?.(
+            `image compaction: ${(shrunk.before / 1048576).toFixed(1)}MB -> ${(shrunk.after / 1048576).toFixed(1)}MB`
+            + ` (${detail}; kept the ${kept} newest untouched)`,
+          );
+        }
+        if (outgoingBody.length > maxUpstreamBytes) {
+          const error = new Error(
+            `Request body is ${(outgoingBody.length / 1048576).toFixed(1)}MB, above the ${(maxUpstreamBytes / 1048576).toFixed(0)}MB upstream limit`
+            + " even after image compaction. Start a new chat, or raise the limit (DSCODEX_MAX_UPSTREAM_BYTES in the router's"
+            + " environment, or max_upstream_bytes in ~/.codex/dscodex/config.json) and restart the router.",
+          );
+          error.statusCode = 413;
+          error.upstreamBytes = outgoingBody.length;
+          throw error;
         }
       }
       const baseUrl = deepSeek ? deepSeekBaseUrl : chatGptBaseUrl;
@@ -771,7 +840,12 @@ export function createProxyServer({
       logger.error?.(`proxy error (${direction} ${pathname}): ${error instanceof Error ? error.message : String(error)}`);
       if (!response.headersSent && !response.destroyed) {
         const status = Number.isInteger(error?.statusCode) ? error.statusCode : 502;
-        json(response, status, { error: { message: status === 413 ? "Request body too large" : "DSCodex upstream request failed" } });
+        const message = status !== 413
+          ? "DSCodex upstream request failed"
+          : error?.upstreamBytes
+            ? error.message
+            : "Request body too large";
+        json(response, status, { error: { message } });
       } else {
         response.destroy(error instanceof Error ? error : undefined);
       }

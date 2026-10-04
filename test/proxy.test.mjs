@@ -5,7 +5,7 @@ import test from "node:test";
 import { once } from "node:events";
 import { gzipSync, zstdCompressSync } from "node:zlib";
 import { WebSocket, WebSocketServer } from "ws";
-import { buildDeepSeekBody, createProxyServer } from "../src/proxy.mjs";
+import { buildDeepSeekBody, compactImagesToBudget, createProxyServer } from "../src/proxy.mjs";
 import { requestModel, routingHintModel, safeCloseCode, websocketTarget } from "../src/websocket-proxy.mjs";
 
 const ROUTER_TOKEN = "A".repeat(43);
@@ -1403,4 +1403,110 @@ test("falls back to the last good model list when ChatGPT is unreachable or fail
   }
   const bare = await modelsProxy(t, { chatGptBaseUrl: upstreamUrl });
   assert.equal((await fetch(route(bare, "/v1/models"))).status, 502);
+});
+
+function imageBody(imageCount, bytesPerImage) {
+  const filler = "A".repeat(bytesPerImage);
+  return {
+    model: "deepseek/deepseek-flash",
+    input: Array.from({ length: imageCount }, (_, index) => ({
+      type: "function_call_output",
+      call_id: `call-${index}`,
+      output: [{
+        type: "input_image",
+        image_url: `data:image/png;base64,${index}${filler}`,
+        // Real Codex image blocks carry `detail`; a marker must not inherit it.
+        detail: "high",
+      }],
+    })),
+  };
+}
+
+function sizeOf(body) {
+  return Buffer.byteLength(JSON.stringify(body), "utf8");
+}
+
+test("image compaction leaves a body that already fits the budget untouched", () => {
+  const body = imageBody(3, 1024);
+  const before = JSON.stringify(body);
+  const result = compactImagesToBudget(body, 8 * 1024 * 1024);
+  assert.deepEqual(result, { before: sizeOf(body), after: sizeOf(body), dropped: 0, images: 0 });
+  assert.equal(JSON.stringify(body), before);
+});
+
+test("image compaction drops the oldest images until the body fits", () => {
+  const body = imageBody(12, 512 * 1024);
+  const budget = 2 * 1024 * 1024;
+  const result = compactImagesToBudget(body, budget, { keepRecent: 3 });
+  assert.ok(result.before > budget, `expected the fixture to start oversized, got ${result.before}`);
+  assert.ok(result.after <= budget, `expected compaction to fit the budget, got ${result.after}`);
+  assert.equal(result.images, 12);
+  assert.ok(result.dropped >= 9, `expected at least the 9 oldest images dropped, got ${result.dropped}`);
+
+  const parts = body.input.flatMap((item) => item.output);
+  const kept = parts.filter((part) => part.type === "input_image");
+  assert.equal(kept.length, 12 - result.dropped);
+  // The newest turn must survive: the tail of the history is what is being answered.
+  assert.equal(parts[parts.length - 1].type, "input_image");
+  for (const part of parts.slice(0, result.dropped)) {
+    assert.equal(part.type, "input_text");
+    assert.equal(part.image_url, undefined);
+    assert.match(part.text, /image omitted by DSCodex/);
+  }
+});
+
+// The direction only shows when the budget is met before the whole droppable
+// range is consumed: dropping all of it looks identical either way. A previous
+// loop walked the range backwards and kept the oldest picture while discarding
+// the ones closest to the live window.
+test("a partial compaction keeps the newest images, not the oldest", () => {
+  const imageCount = 12;
+  const keepRecent = 4;
+  const droppable = imageCount - keepRecent;
+  const body = imageBody(imageCount, 512 * 1024);
+  const perImage = sizeOf(body) / imageCount;
+  // Enough for 7 survivors, so 5 of the 8 droppable images have to go.
+  const budget = Math.floor(perImage * 7.5);
+
+  const result = compactImagesToBudget(body, budget, { keepRecent });
+  assert.ok(result.after <= budget, `expected compaction to fit the budget, got ${result.after}`);
+  assert.ok(
+    result.dropped > 0 && result.dropped < droppable,
+    `expected a partial drop of 1..${droppable - 1} images to make the direction observable, got ${result.dropped}`,
+  );
+
+  const parts = body.input.flatMap((item) => item.output);
+  const survivors = parts
+    .map((part, index) => (part.type === "input_image" ? index : -1))
+    .filter((index) => index >= 0);
+  assert.deepEqual(
+    survivors,
+    Array.from({ length: imageCount - result.dropped }, (_, index) => index + result.dropped),
+    "the surviving images must be the newest tail of the history",
+  );
+  assert.equal(parts[0].type, "input_text", "the oldest image must be the first to go");
+  assert.equal(parts[parts.length - 1].type, "input_image");
+});
+
+test("a replaced image leaves a clean self-describing record in its own slot", () => {
+  const body = imageBody(6, 512 * 1024);
+  const perImage = sizeOf(body) / 6;
+  const result = compactImagesToBudget(body, Math.floor(perImage * 4.5), { keepRecent: 4 });
+  assert.equal(result.dropped, 2);
+
+  const replaced = body.input[0].output[0];
+  assert.deepEqual(Object.keys(replaced).sort(), ["text", "type"]);
+  assert.equal(replaced.type, "input_text");
+  assert.match(replaced.text, /image omitted by DSCodex/);
+  assert.match(replaced.text, /transcript image 1 of 6/);
+  assert.match(replaced.text, /image\/png/);
+
+  // The item keeps its identity and its output array, so the tool-call replay
+  // pairing that DeepSeek requires is untouched.
+  assert.equal(body.input[0].type, "function_call_output");
+  assert.equal(body.input[0].call_id, "call-0");
+  assert.ok(Array.isArray(body.input[0].output));
+  assert.equal(body.input[1].output[0].type, "input_text");
+  assert.match(body.input[1].output[0].text, /transcript image 2 of 6/);
+  assert.equal(body.input[2].output[0].type, "input_image");
 });
