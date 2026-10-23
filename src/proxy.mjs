@@ -178,9 +178,14 @@ function convertInputItem(item, compactionSecret) {
   if (item.type === "compaction") {
     const summary = openCompaction(item.encrypted_content, compactionSecret);
     if (summary) {
+      // Automatic compaction resumes the same DeepSeek turn without a new user
+      // message. If the restored summary is the final `assistant` item and tools
+      // are enabled, DeepSeek treats it as its own prior thinking turn and rejects
+      // the continuation because no matching `reasoning_text` was replayed.
+      // Replay the compact summary as user handoff context instead.
       return {
         type: "message",
-        role: "assistant",
+        role: "user",
         content: [{ type: "input_text", text: `[Compacted prior context]\n${summary}` }],
       };
     }

@@ -277,21 +277,22 @@ test("adapts Codex remote compaction v2 to a DeepSeek summary and restores it on
   assert.equal(observed[0].model, "deepseek-flash");
   assert.match(observed[0].input.at(-1).content[0].text, /compact handoff summary/i);
 
+  // Automatic compaction resumes the same turn. There is no new user message
+  // after the compaction item, and the continuation still has tools enabled.
   const replayResponse = await fetch(route(proxyUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: "deepseek/deepseek-v4-pro",
-      input: [
-        compactItem,
-        { type: "message", role: "user", content: [{ type: "input_text", text: "Continue" }] },
-      ],
+      tools: [{ type: "function", name: "shell" }],
+      parallel_tool_calls: false,
+      input: [compactItem],
     }),
   });
   assert.equal(replayResponse.status, 200);
   await replayResponse.text();
   assert.equal(observed[1].input.some((item) => item.type === "compaction"), false);
-  const restored = observed[1].input.find((item) => item.role === "assistant");
+  const restored = observed[1].input.find((item) => item.role === "user");
   assert.match(restored.content[0].text, /Compacted prior context/);
   assert.match(restored.content[0].text, /tests and a restart are still pending/);
   const gptReplay = await fetch(route(proxyUrl), {
