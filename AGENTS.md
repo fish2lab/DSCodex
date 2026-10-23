@@ -141,7 +141,9 @@ The non-negotiable details:
     for a compact handoff summary, and return exactly one synthetic `compaction` output item before
     `response.completed`. Encrypt the summary with AES-256-GCM using a key derived from the stable
     router token; on later DeepSeek requests, decrypt only DSCodex-prefixed compaction items and
-    restore them as assistant summary context. A compaction item that cannot be decrypted
+    restore them as user handoff context. Automatic compaction resumes the same turn without a
+    new user message; restoring the final summary as `assistant` while tools are enabled makes
+    DeepSeek demand a missing `reasoning_text` and reject the continuation. A compaction item that cannot be decrypted
     (GPT-sealed after a provider switch, or a rotated token) must be dropped, never forwarded raw
     to DeepSeek. Never route compaction through GPT or store the summary as plaintext in the
     rollout file.
